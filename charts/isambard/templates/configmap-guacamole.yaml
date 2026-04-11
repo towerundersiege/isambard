@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "isambard.fullname" . }}-guacamole
+  labels:
+    {{- include "isambard.labels" . | nindent 4 }}
+data:
+  user-mapping.xml: |
+    <user-mapping>
+        <authorize username="{{ .Values.guacamole.userMapping.username }}" password="{{ .Values.guacamole.userMapping.password }}">
+            <connection name="{{ .Values.guacamole.userMapping.connectionName }}">
+                <protocol>vnc</protocol>
+                <param name="hostname">{{ .Values.guacamole.userMapping.hostname }}</param>
+                <param name="port">{{ .Values.guacamole.userMapping.port }}</param>
+                <param name="password">{{ .Values.guacamole.userMapping.vncPassword }}</param>
+                <param name="cursor">remote</param>
+                <param name="color-depth">{{ .Values.guacamole.userMapping.colorDepth }}</param>
+                <param name="disable-display-resize">{{ ternary "true" "false" .Values.guacamole.userMapping.disableDisplayResize }}</param>
+            </connection>
+        </authorize>
+    </user-mapping>

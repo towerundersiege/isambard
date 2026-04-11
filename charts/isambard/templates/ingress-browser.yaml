@@ -1,0 +1,33 @@
+{{- if and .Values.ingress.enabled .Values.ingress.browser.host }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "isambard.fullname" . }}-browser
+  labels:
+    {{- include "isambard.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.browser.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "isambard.fullname" . }}-browser
+                port:
+                  number: {{ .Values.service.browser.port }}
+  {{- if .Values.ingress.browser.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.browser.host }}
+      secretName: {{ .Values.ingress.browser.tlsSecretName }}
+  {{- end }}
+{{- end }}

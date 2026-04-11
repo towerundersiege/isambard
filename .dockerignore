@@ -1,0 +1,5 @@
+venv
+.venv
+__pycache__
+.pycache_local
+downloads

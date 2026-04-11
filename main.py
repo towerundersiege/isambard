@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+import logging
+import uvicorn
+from pathlib import Path
+
+from downloader_app.download_manager import DownloadManager
+from downloader_app.web import build_app
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOADS_DIR = BASE_DIR / "downloads"
+DOWNLOAD_MANAGER = DownloadManager(
+    downloads_dir=DOWNLOADS_DIR,
+    state_file=DOWNLOADS_DIR / ".task-history.json",
+)
+app = build_app(DOWNLOAD_MANAGER)
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.error").setLevel(logging.INFO)
+    logging.getLogger("isambard").info("starting isambard app")
+    uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,13 @@
+<user-mapping>
+    <authorize username="guac" password="guac">
+        <connection name="Remote Chromium">
+            <protocol>vnc</protocol>
+            <param name="hostname">browser</param>
+            <param name="port">5900</param>
+            <param name="password">browserpass</param>
+            <param name="cursor">remote</param>
+            <param name="color-depth">16</param>
+            <param name="disable-display-resize">true</param>
+        </connection>
+    </authorize>
+</user-mapping>

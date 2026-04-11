@@ -1,0 +1,110 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+images:
+  app:
+    repository: isambard-app
+    tag: latest
+    pullPolicy: IfNotPresent
+  browser:
+    repository: isambard-browser
+    tag: latest
+    pullPolicy: IfNotPresent
+  guacd:
+    repository: guacamole/guacd
+    tag: "1.6.0"
+    pullPolicy: IfNotPresent
+  guacamole:
+    repository: guacamole/guacamole
+    tag: "1.6.0"
+    pullPolicy: IfNotPresent
+  gluetun:
+    repository: qmcgaw/gluetun
+    tag: latest
+    pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+securityContext: {}
+
+gluetun:
+  enabled: true
+  securityContext:
+    capabilities:
+      add:
+        - NET_ADMIN
+  env:
+    VPN_SERVICE_PROVIDER: mullvad
+    VPN_TYPE: wireguard
+    WIREGUARD_PRIVATE_KEY: ""
+    WIREGUARD_ADDRESSES: ""
+
+app:
+  env:
+    BROWSER_URL: https://isambard-browser.example.com
+    BROWSER_USER: guac
+    BROWSER_PASSWORD: guac
+
+browser:
+  shmSize: 1Gi
+
+guacamole:
+  env:
+    WEBAPP_CONTEXT: ROOT
+    GUACD_HOSTNAME: 127.0.0.1
+  userMapping:
+    username: guac
+    password: guac
+    connectionName: Remote Chromium
+    hostname: 127.0.0.1
+    port: 5900
+    vncPassword: browserpass
+    colorDepth: 16
+    disableDisplayResize: true
+
+persistence:
+  downloads:
+    enabled: true
+    accessMode: ReadWriteOnce
+    size: 50Gi
+    storageClassName: ""
+
+service:
+  app:
+    type: ClusterIP
+    port: 8765
+    targetPort: 8765
+  browser:
+    type: ClusterIP
+    port: 8080
+    targetPort: 8080
+
+ingress:
+  enabled: true
+  className: ""
+  annotations: {}
+  app:
+    host: isambard.example.com
+    tlsSecretName: ""
+  browser:
+    host: isambard-browser.example.com
+    tlsSecretName: ""
+
+resources:
+  app: {}
+  browser: {}
+  guacd: {}
+  guacamole: {}
+  gluetun: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

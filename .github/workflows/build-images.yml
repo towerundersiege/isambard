@@ -1,0 +1,49 @@
+name: build-images
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build app image
+        run: docker buildx build --platform linux/amd64 -t isambard-app:${GITHUB_SHA} -f Dockerfile --load .
+
+      - name: Build browser image
+        run: docker buildx build --platform linux/amd64 -t isambard-browser:${GITHUB_SHA} -f browser.Dockerfile --load .
+
+      - name: Export bundled image archive
+        run: |
+          mkdir -p dist
+          docker save isambard-app:${GITHUB_SHA} isambard-browser:${GITHUB_SHA} | gzip -1 > dist/isambard-images-linux-amd64.tar.gz
+          sha256sum dist/isambard-images-linux-amd64.tar.gz > dist/isambard-images-linux-amd64.tar.gz.sha256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: isambard-images-linux-amd64
+          path: dist/isambard-images-linux-amd64.tar.gz*
+          if-no-files-found: error
+
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/isambard-images-linux-amd64.tar.gz
+            dist/isambard-images-linux-amd64.tar.gz.sha256

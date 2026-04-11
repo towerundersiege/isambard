@@ -1,0 +1,17 @@
+{{- if .Values.persistence.downloads.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "isambard.fullname" . }}-downloads
+  labels:
+    {{- include "isambard.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.downloads.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.downloads.size }}
+  {{- if .Values.persistence.downloads.storageClassName }}
+  storageClassName: {{ .Values.persistence.downloads.storageClassName }}
+  {{- end }}
+{{- end }}

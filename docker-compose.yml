@@ -1,0 +1,39 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: downloader-app
+    environment:
+      BROWSER_URL: http://localhost:8081
+      BROWSER_USER: guac
+      BROWSER_PASSWORD: guac
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./downloads:/app/downloads
+
+  guacd:
+    image: guacamole/guacd:1.6.0
+    container_name: downloader-guacd
+
+  guacamole:
+    image: guacamole/guacamole:1.6.0
+    container_name: downloader-guacamole
+    depends_on:
+      - guacd
+      - browser
+    environment:
+      GUACD_HOSTNAME: guacd
+      WEBAPP_CONTEXT: ROOT
+    volumes:
+      - ./guacamole/user-mapping.xml:/etc/guacamole/user-mapping.xml:ro
+    ports:
+      - "${ISAMBARD_BROWSER_PORT:-8766}:8080"
+
+  browser:
+    build:
+      context: .
+      dockerfile: browser.Dockerfile
+    container_name: downloader-browser
+    shm_size: 1gb

@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "YFlix Stream Capture",
+  "version": "1.0.0",
+  "description": "Captures HLS streams on yflix watch pages and queues them into the downloader app.",
+  "permissions": ["webRequest", "tabs", "storage"],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://yflix.to/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

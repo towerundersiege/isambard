@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "isambard.fullname" . }}
+  labels:
+    {{- include "isambard.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "isambard.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "isambard.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "isambard.serviceAccountName" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      containers:
+        {{- if .Values.gluetun.enabled }}
+        - name: gluetun
+          image: "{{ .Values.images.gluetun.repository }}:{{ .Values.images.gluetun.tag }}"
+          imagePullPolicy: {{ .Values.images.gluetun.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.gluetun.securityContext | nindent 12 }}
+          env:
+            - name: VPN_SERVICE_PROVIDER
+              value: {{ .Values.gluetun.env.VPN_SERVICE_PROVIDER | quote }}
+            - name: VPN_TYPE
+              value: {{ .Values.gluetun.env.VPN_TYPE | quote }}
+            - name: WIREGUARD_PRIVATE_KEY
+              value: {{ .Values.gluetun.env.WIREGUARD_PRIVATE_KEY | quote }}
+            - name: WIREGUARD_ADDRESSES
+              value: {{ .Values.gluetun.env.WIREGUARD_ADDRESSES | quote }}
+          ports:
+            - name: app
+              containerPort: {{ .Values.service.app.targetPort }}
+            - name: browser
+              containerPort: {{ .Values.service.browser.targetPort }}
+          resources:
+            {{- toYaml .Values.resources.gluetun | nindent 12 }}
+        {{- end }}
+        - name: app
+          image: "{{ .Values.images.app.repository }}:{{ .Values.images.app.tag }}"
+          imagePullPolicy: {{ .Values.images.app.pullPolicy }}
+          env:
+            - name: BROWSER_URL
+              value: {{ .Values.app.env.BROWSER_URL | quote }}
+            - name: BROWSER_USER
+              value: {{ .Values.app.env.BROWSER_USER | quote }}
+            - name: BROWSER_PASSWORD
+              value: {{ .Values.app.env.BROWSER_PASSWORD | quote }}
+          ports:
+            - name: http-app
+              containerPort: 8765
+          volumeMounts:
+            - name: downloads
+              mountPath: /app/downloads
+          resources:
+            {{- toYaml .Values.resources.app | nindent 12 }}
+        - name: guacd
+          image: "{{ .Values.images.guacd.repository }}:{{ .Values.images.guacd.tag }}"
+          imagePullPolicy: {{ .Values.images.guacd.pullPolicy }}
+          resources:
+            {{- toYaml .Values.resources.guacd | nindent 12 }}
+        - name: guacamole
+          image: "{{ .Values.images.guacamole.repository }}:{{ .Values.images.guacamole.tag }}"
+          imagePullPolicy: {{ .Values.images.guacamole.pullPolicy }}
+          env:
+            - name: WEBAPP_CONTEXT
+              value: {{ .Values.guacamole.env.WEBAPP_CONTEXT | quote }}
+            - name: GUACD_HOSTNAME
+              value: {{ .Values.guacamole.env.GUACD_HOSTNAME | quote }}
+          ports:
+            - name: http-browser
+              containerPort: 8080
+          volumeMounts:
+            - name: guacamole-config
+              mountPath: /etc/guacamole/user-mapping.xml
+              subPath: user-mapping.xml
+          resources:
+            {{- toYaml .Values.resources.guacamole | nindent 12 }}
+        - name: browser
+          image: "{{ .Values.images.browser.repository }}:{{ .Values.images.browser.tag }}"
+          imagePullPolicy: {{ .Values.images.browser.pullPolicy }}
+          ports:
+            - name: vnc
+              containerPort: 5900
+          volumeMounts:
+            - name: browser-shm
+              mountPath: /dev/shm
+          resources:
+            {{- toYaml .Values.resources.browser | nindent 12 }}
+      volumes:
+        - name: guacamole-config
+          configMap:
+            name: {{ include "isambard.fullname" . }}-guacamole
+        - name: browser-shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.browser.shmSize }}
+        - name: downloads
+          {{- if .Values.persistence.downloads.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "isambard.fullname" . }}-downloads
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
