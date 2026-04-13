@@ -10,10 +10,14 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    env:
+      APP_IMAGE: ghcr.io/${{ github.repository_owner }}/isambard-app
+      BROWSER_IMAGE: ghcr.io/${{ github.repository_owner }}/isambard-browser
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,13 +25,54 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build app image
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        run: |
+          APP_TAGS="${APP_IMAGE}:sha-${GITHUB_SHA}"
+          BROWSER_TAGS="${BROWSER_IMAGE}:sha-${GITHUB_SHA}"
+          if [ "${GITHUB_REF_TYPE}" = "branch" ] && [ "${GITHUB_REF_NAME}" = "main" ]; then
+            APP_TAGS="${APP_TAGS},${APP_IMAGE}:latest"
+            BROWSER_TAGS="${BROWSER_TAGS},${BROWSER_IMAGE}:latest"
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            APP_TAGS="${APP_TAGS},${APP_IMAGE}:${GITHUB_REF_NAME}"
+            BROWSER_TAGS="${BROWSER_TAGS},${BROWSER_IMAGE}:${GITHUB_REF_NAME}"
+          fi
+          echo "app_tags=${APP_TAGS}" >> "${GITHUB_OUTPUT}"
+          echo "browser_tags=${BROWSER_TAGS}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push app image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.app_tags }}
+
+      - name: Build and push browser image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: browser.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.browser_tags }}
+
+      - name: Build downloadable app image
         run: docker buildx build --platform linux/amd64 -t isambard-app:${GITHUB_SHA} -f Dockerfile --load .
 
-      - name: Build browser image
+      - name: Build downloadable browser image
         run: docker buildx build --platform linux/amd64 -t isambard-browser:${GITHUB_SHA} -f browser.Dockerfile --load .
 
-      - name: Export bundled image archive
+      - name: Export downloadable image archive
         run: |
           mkdir -p dist
           docker save isambard-app:${GITHUB_SHA} isambard-browser:${GITHUB_SHA} | gzip -1 > dist/isambard-images-linux-amd64.tar.gz
