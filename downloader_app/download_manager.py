@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
-import queue
 import re
 import shutil
 import subprocess
 import threading
 import uuid
 import json
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,8 +21,14 @@ PROGRESS_RE = re.compile(
     r"\[download\]\s+(?P<percent>\d+(?:\.\d+)?)%(?:\s+of\s+(?P<size>\S+))?"
     r"(?:\s+at\s+(?P<speed>\S+))?(?:\s+ETA\s+(?P<eta>\S+))?"
 )
-MAX_CONCURRENT_DOWNLOADS = 5
 LOGGER = logging.getLogger("isambard.downloads")
+
+
+def _read_concurrency(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
 
 
 @dataclass
@@ -48,6 +54,10 @@ class DownloadTask:
     filesize: str = ""
     output: str = ""
     error: str = ""
+    source_type: str = "standard"
+    youtube_id: str = ""
+    channel_id: str = ""
+    upload_date: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -62,22 +72,34 @@ class DownloadManager:
         self.downloads_dir = downloads_dir
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = state_file or (self.downloads_dir / ".task-history.json")
+        self.youtube_archive_file = self.downloads_dir / ".youtube-archive.txt"
+        self.youtube_cookies_file = self.downloads_dir / "youtube" / "cookies.txt"
         self._resolver = MetadataResolver()
         self._lock = threading.RLock()
         self._tasks: list[DownloadTask] = []
         self._index: dict[str, DownloadTask] = {}
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._stop_requested: set[str] = set()
-        self._queue: queue.Queue[str] = queue.Queue()
+        self._condition = threading.Condition(self._lock)
+        self._running_counts: dict[str, int] = {}
+        self._concurrency_limits = {
+            "movie": _read_concurrency("MOVIE_DOWNLOAD_CONCURRENCY", 5),
+            "tv": _read_concurrency("TV_DOWNLOAD_CONCURRENCY", 5),
+            "youtube": _read_concurrency("YOUTUBE_DOWNLOAD_CONCURRENCY", 5),
+            "standard": _read_concurrency("STANDARD_DOWNLOAD_CONCURRENCY", 5),
+        }
         self._load_state()
+        worker_count = max(1, sum(self._concurrency_limits.values()))
         self._workers = [
             threading.Thread(target=self._run, daemon=True, name=f"download-worker-{index + 1}")
-            for index in range(MAX_CONCURRENT_DOWNLOADS)
+            for index in range(worker_count)
         ]
         for worker in self._workers:
             worker.start()
 
     def enqueue(self, title: str, url: str, metadata: dict[str, Any] | None = None) -> DownloadTask:
+        if metadata and metadata.get("source_type") == "youtube":
+            return self.enqueue_youtube(metadata)
         resolved = self._resolver.resolve(title, metadata)
         task = DownloadTask(
             id=str(uuid.uuid4()),
@@ -85,6 +107,7 @@ class DownloadManager:
             url=url,
             output_template=str(self.downloads_dir / resolved.output_template),
             media_type=resolved.media_type,
+            source_type=resolved.media_type,
             series_name=resolved.series_name,
             series_year=resolved.series_year,
             season=resolved.season,
@@ -94,9 +117,56 @@ class DownloadManager:
             self._tasks.append(task)
             self._index[task.id] = task
             self._save_state_locked()
+            self._condition.notify_all()
         LOGGER.info("enqueued task id=%s title=%s url=%s", task.id, task.title, task.url)
-        self._queue.put(task.id)
         return task
+
+    def enqueue_youtube(self, metadata: dict[str, Any]) -> DownloadTask:
+        resolved = self._resolver.resolve_youtube(metadata)
+        task = DownloadTask(
+            id=str(uuid.uuid4()),
+            title=resolved.display_title,
+            url=str(metadata.get("url") or ""),
+            output_template=str(self.downloads_dir / resolved.output_template),
+            media_type=resolved.media_type,
+            source_type=resolved.media_type,
+            youtube_id=resolved.youtube_id,
+            channel_id=resolved.channel_id,
+            upload_date=resolved.upload_date,
+        )
+        with self._lock:
+            self._tasks.append(task)
+            self._index[task.id] = task
+            self._save_state_locked()
+            self._condition.notify_all()
+        LOGGER.info(
+            "enqueued youtube task id=%s title=%s video_id=%s",
+            task.id,
+            task.title,
+            task.youtube_id,
+        )
+        return task
+
+    def youtube_video_status(self, youtube_id: str) -> str:
+        youtube_id = (youtube_id or "").strip()
+        if not youtube_id:
+            return ""
+        with self._lock:
+            for task in reversed(self._tasks):
+                if task.youtube_id != youtube_id:
+                    continue
+                if task.status == "completed":
+                    return "downloaded"
+                return task.status
+        if self.youtube_archive_file.exists():
+            needle = f"youtube {youtube_id}"
+            try:
+                for line in self.youtube_archive_file.read_text().splitlines():
+                    if line.strip() == needle:
+                        return "downloaded"
+            except Exception:
+                LOGGER.exception("failed to read youtube archive")
+        return ""
 
     def snapshot(self) -> dict[str, list[dict[str, Any]]]:
         with self._lock:
@@ -121,6 +191,7 @@ class DownloadManager:
                 task.error = "Stopped before download started"
                 self._delete_generated_files(task)
                 self._save_state_locked()
+                self._condition.notify_all()
                 LOGGER.info("removed queued task id=%s title=%s", task.id, task.title)
                 return task
             if task.status != "running":
@@ -149,10 +220,12 @@ class DownloadManager:
 
     def _run(self) -> None:
         while True:
-            task_id = self._queue.get()
-            task = self._index[task_id]
+            with self._condition:
+                task = self._reserve_next_task_locked()
+                while task is None:
+                    self._condition.wait()
+                    task = self._reserve_next_task_locked()
             self._execute(task)
-            self._queue.task_done()
 
     def _execute(self, task: DownloadTask) -> None:
         yt_dlp_bin = os.environ.get("YT_DLP_BIN", "yt-dlp")
@@ -163,6 +236,7 @@ class DownloadManager:
                 task.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 task.error = f"Unable to find yt-dlp binary: {yt_dlp_bin}"
                 self._save_state_locked()
+                self._release_slot_locked(task)
             LOGGER.error("yt-dlp not found task id=%s binary=%s", task.id, yt_dlp_bin)
             return
 
@@ -182,14 +256,11 @@ class DownloadManager:
             str(output_template),
             task.url,
         ]
-        with self._lock:
-            if task.status != "queued":
-                return
-            task.status = "running"
-            task.started_at = task.started_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
-            task.finished_at = None
-            task.error = ""
-            self._save_state_locked()
+        if task.source_type == "youtube":
+            youtube_args = ["--download-archive", str(self.youtube_archive_file)]
+            if self.youtube_cookies_file.exists():
+                youtube_args.extend(["--cookies", str(self.youtube_cookies_file)])
+            command[1:1] = youtube_args
         LOGGER.info("starting download task id=%s title=%s", task.id, task.title)
 
         try:
@@ -206,6 +277,7 @@ class DownloadManager:
                 task.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 task.error = str(exc)
                 self._save_state_locked()
+                self._release_slot_locked(task)
             LOGGER.exception("failed to start yt-dlp task id=%s", task.id)
             return
 
@@ -238,12 +310,18 @@ class DownloadManager:
                 self._delete_generated_files(task)
                 self._save_state_locked()
                 LOGGER.info("download stopped task id=%s title=%s", task.id, task.title)
+                self._apply_youtube_cooldown(task)
+                with self._lock:
+                    self._release_slot_locked(task)
                 return
             if return_code != 0:
                 task.status = "failed"
                 task.error = task.output.splitlines()[-1] if task.output else "yt-dlp failed"
                 self._save_state_locked()
                 LOGGER.error("download failed task id=%s title=%s return_code=%s", task.id, task.title, return_code)
+                self._apply_youtube_cooldown(task)
+                with self._lock:
+                    self._release_slot_locked(task)
                 return
 
         verification_error = self._verify_download(task)
@@ -259,6 +337,9 @@ class DownloadManager:
                 task.eta = ""
                 LOGGER.info("download completed task id=%s title=%s", task.id, task.title)
             self._save_state_locked()
+        self._apply_youtube_cooldown(task)
+        with self._lock:
+            self._release_slot_locked(task)
 
     def _update_progress(self, task: DownloadTask, line: str, output: str) -> None:
         match = PROGRESS_RE.search(line)
@@ -359,10 +440,52 @@ class DownloadManager:
                 task.error = ""
                 task.speed = ""
                 task.eta = ""
-                self._queue.put(task.id)
                 LOGGER.info("requeued persisted task id=%s title=%s", task.id, task.title)
+        with self._condition:
+            self._condition.notify_all()
 
     def _save_state_locked(self) -> None:
         temp_path = self.state_file.with_suffix(self.state_file.suffix + ".tmp")
         temp_path.write_text(json.dumps({"tasks": [task.to_dict() for task in self._tasks]}, indent=2))
         temp_path.replace(self.state_file)
+
+    def _task_source(self, task: DownloadTask) -> str:
+        return (task.source_type or task.media_type or "standard").strip() or "standard"
+
+    def _limit_for_source(self, source: str) -> int:
+        return self._concurrency_limits.get(source, self._concurrency_limits["standard"])
+
+    def _reserve_next_task_locked(self) -> DownloadTask | None:
+        for task in self._tasks:
+            if task.status != "queued":
+                continue
+            source = self._task_source(task)
+            if self._running_counts.get(source, 0) >= self._limit_for_source(source):
+                continue
+            self._running_counts[source] = self._running_counts.get(source, 0) + 1
+            task.status = "running"
+            task.started_at = task.started_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+            task.finished_at = None
+            task.error = ""
+            task.speed = ""
+            task.eta = ""
+            self._save_state_locked()
+            return task
+        return None
+
+    def _release_slot_locked(self, task: DownloadTask) -> None:
+        source = self._task_source(task)
+        current = self._running_counts.get(source, 0)
+        if current <= 1:
+            self._running_counts.pop(source, None)
+        else:
+            self._running_counts[source] = current - 1
+        self._condition.notify_all()
+
+    def _apply_youtube_cooldown(self, task: DownloadTask) -> None:
+        if task.source_type != "youtube":
+            return
+        cooldown = max(0, int(os.environ.get("YOUTUBE_DOWNLOAD_COOLDOWN_SECONDS", "20")))
+        if cooldown:
+            LOGGER.info("youtube cooldown task id=%s seconds=%s", task.id, cooldown)
+            time.sleep(cooldown)

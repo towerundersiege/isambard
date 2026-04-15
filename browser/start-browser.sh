@@ -25,6 +25,10 @@ export HOME=/home/browser
 export XDG_RUNTIME_DIR=/tmp/runtime-browser
 eval "$(dbus-launch --sh-syntax)"
 openbox --config-file /etc/xdg/openbox/rc.xml &
+EXTENSION_PATHS="/opt/yflix-extension"
+if [ -f /opt/adblock-extension/manifest.json ]; then
+  EXTENSION_PATHS="/opt/yflix-extension,/opt/adblock-extension"
+fi
 while true; do
   chromium \
     --no-sandbox \
@@ -42,8 +46,8 @@ while true; do
     --disable-session-crashed-bubble \
     --window-position=0,0 \
     --window-size=1024,576 \
-    --disable-extensions-except=/opt/yflix-extension \
-    --load-extension=/opt/yflix-extension \
+    --disable-extensions-except="${EXTENSION_PATHS}" \
+    --load-extension="${EXTENSION_PATHS}" \
     --app=https://yflix.to || true
   sleep 2
 done'

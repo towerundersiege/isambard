@@ -1,32 +1,17 @@
 services:
-  gluetun:
-    image: qmcgaw/gluetun:latest
-    container_name: gluetun
-    restart: unless-stopped
-    cap_add:
-      - NET_ADMIN
-    ports:
-      - "8765:8765/tcp"
-      - "${ISAMBARD_BROWSER_PORT:-8766}:8080/tcp"
-    environment:
-      - VPN_SERVICE_PROVIDER=mullvad
-      - VPN_TYPE=wireguard
-      - WIREGUARD_PRIVATE_KEY=${GLUETUN_WIREGUARD_PRIVATE_KEY:?set in .env}
-      - WIREGUARD_ADDRESSES=${GLUETUN_WIREGUARD_ADDRESSES:?set in .env}
-
   isambard-app:
     image: isambard-app:latest
     platform: linux/amd64
     container_name: isambard-app
     restart: unless-stopped
     depends_on:
-      - gluetun
       - isambard-guacd
       - isambard-guacamole
       - isambard-browser
-    network_mode: "service:gluetun"
+    ports:
+      - "8765:8765"
     environment:
-      - BROWSER_URL=${ISAMBARD_BROWSER_URL:-https://isambard-browser.towerundersiege.com}
+      - BROWSER_URL=${ISAMBARD_BROWSER_URL:-http://localhost:${ISAMBARD_BROWSER_PORT:-8766}}
       - BROWSER_USER=${ISAMBARD_BROWSER_USER:-guac}
       - BROWSER_PASSWORD=${ISAMBARD_BROWSER_PASSWORD:-guac}
     volumes:
@@ -37,9 +22,6 @@ services:
     platform: linux/amd64
     container_name: isambard-guacd
     restart: unless-stopped
-    depends_on:
-      - gluetun
-    network_mode: "service:gluetun"
 
   isambard-guacamole:
     image: guacamole/guacamole:1.6.0
@@ -47,12 +29,12 @@ services:
     container_name: isambard-guacamole
     restart: unless-stopped
     depends_on:
-      - gluetun
       - isambard-guacd
       - isambard-browser
-    network_mode: "service:gluetun"
+    ports:
+      - "${ISAMBARD_BROWSER_PORT:-8766}:8080"
     environment:
-      - GUACD_HOSTNAME=127.0.0.1
+      - GUACD_HOSTNAME=isambard-guacd
       - WEBAPP_CONTEXT=ROOT
     volumes:
       - /data/crimson/config/isambard/guacamole/user-mapping.xml:/etc/guacamole/user-mapping.xml:ro
@@ -62,7 +44,4 @@ services:
     platform: linux/amd64
     container_name: isambard-browser
     restart: unless-stopped
-    depends_on:
-      - gluetun
-    network_mode: "service:gluetun"
     shm_size: 1gb

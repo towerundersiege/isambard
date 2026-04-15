@@ -2,8 +2,15 @@ const streamsByTab = new Map();
 const pageStateByTab = new Map();
 const primaryTabByWindow = new Map();
 const historyByTab = new Map();
+let lastStateTabId = null;
 let lastCommandId = 0;
+const SUPPORTED_BASES = [
+  "https://yflix.to/",
+  "https://dashflix.top/"
+];
+const DEFAULT_BROWSER_URL = SUPPORTED_BASES[0];
 const queueEndpoints = [
+  "http://isambard-app:8765/api/browser/queue",
   "http://app:8765/api/browser/queue",
   "http://downloader-app:8765/api/browser/queue",
   "http://127.0.0.1:8765/api/browser/queue",
@@ -11,7 +18,11 @@ const queueEndpoints = [
 ];
 
 function normalizeTitle(metadata) {
-  const rawTitle = (metadata.raw_title || "Untitled").trim().replace(/\s*[-|]\s*Y?Flix.*$/i, "").trim();
+  const rawTitle = (metadata.raw_title || "Untitled")
+    .trim()
+    .replace(/\s*[-|]\s*Y?Flix.*$/i, "")
+    .replace(/\s*[-|]\s*DashFlix.*$/i, "")
+    .trim();
   if (metadata.season && metadata.episode) {
     const season = String(metadata.season).padStart(2, "0");
     const episode = String(metadata.episode).padStart(2, "0");
@@ -32,12 +43,13 @@ function rememberStream(tabId, details) {
   publishState(tabId).catch(() => {});
 }
 
-function isYflixUrl(url) {
-  return typeof url === "string" && url.startsWith("https://yflix.to/");
+function isSupportedUrl(url) {
+  return typeof url === "string" && SUPPORTED_BASES.some((base) => url.startsWith(base));
 }
 
 function stateEndpoints() {
   return [
+    "http://isambard-app:8765/api/browser/state",
     "http://app:8765/api/browser/state",
     "http://downloader-app:8765/api/browser/state",
     "http://127.0.0.1:8765/api/browser/state",
@@ -47,6 +59,7 @@ function stateEndpoints() {
 
 function commandEndpoints() {
   return [
+    "http://isambard-app:8765/api/browser/command",
     "http://app:8765/api/browser/command",
     "http://downloader-app:8765/api/browser/command",
     "http://127.0.0.1:8765/api/browser/command",
@@ -55,7 +68,7 @@ function commandEndpoints() {
 }
 
 function pickPrimaryTab(tabs) {
-  return tabs.find((tab) => isYflixUrl(tab.url)) || tabs[0] || null;
+  return tabs.find((tab) => isSupportedUrl(tab.url)) || tabs[0] || null;
 }
 
 function updatePrimaryTab(windowId, tabId) {
@@ -148,7 +161,9 @@ async function pollBrowserCommand() {
   if (!command || !command.action || !command.id || command.id <= lastCommandId) {
     return;
   }
-  const handled = await executeBrowserCommand(command.action);
+  const handled = command.action === "navigate" && command.value
+    ? await executeBrowserNavigation(command.value)
+    : await executeBrowserCommand(command.action);
   if (!handled) {
     return;
   }
@@ -165,11 +180,56 @@ async function pollBrowserCommand() {
 
 function getPrimaryTab(callback) {
   chrome.tabs.query({}, (tabs) => {
+    const lastStateTab = lastStateTabId == null ? null : tabs.find((tab) => tab.id === lastStateTabId);
     const preferred = Array.from(primaryTabByWindow.values())
       .map((tabId) => tabs.find((tab) => tab.id === tabId))
       .find(Boolean);
-    const fallback = tabs.find((tab) => isYflixUrl(tab.url)) || tabs[0] || null;
-    callback(preferred || fallback || null);
+    const fallback = tabs.find((tab) => isSupportedUrl(tab.url)) || tabs[0] || null;
+    callback(lastStateTab || preferred || fallback || null);
+  });
+}
+
+function executeBrowserNavigation(url) {
+  return new Promise((resolve) => {
+    getPrimaryTab((tab) => {
+      if (!tab || tab.id == null) {
+        resolve(false);
+        return;
+      }
+      if (tab.windowId != null) {
+        updatePrimaryTab(tab.windowId, tab.id);
+      }
+      lastStateTabId = tab.id;
+      streamsByTab.set(tab.id, []);
+      historyByTab.set(tab.id, { entries: [url], index: 0 });
+      pageStateByTab.set(tab.id, {
+        page_url: url,
+        page_title: "",
+        metadata: {}
+      });
+      publishState(tab.id).catch(() => {});
+      chrome.tabs.sendMessage(tab.id, { type: "navigate", url }, (response) => {
+        if (chrome.runtime.lastError) {
+          chrome.tabs.update(tab.id, { url, active: true }, () => {
+            if (chrome.runtime.lastError) {
+              console.warn("browser navigate update warning", chrome.runtime.lastError.message);
+            }
+            resolve(true);
+          });
+          return;
+        }
+        if (response && response.ok) {
+          resolve(true);
+          return;
+        }
+        chrome.tabs.update(tab.id, { url, active: true }, () => {
+          if (chrome.runtime.lastError) {
+            console.warn("browser navigate update warning", chrome.runtime.lastError.message);
+          }
+          resolve(true);
+        });
+      });
+    });
   });
 }
 
@@ -262,17 +322,20 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (tab.windowId != null) {
     updatePrimaryTab(tab.windowId, tabId);
   }
+  if (isSupportedUrl(changeInfo.url || tab.url || "")) {
+    lastStateTabId = tabId;
+  }
   if (changeInfo.url) {
-    if (isYflixUrl(changeInfo.url)) {
+    if (isSupportedUrl(changeInfo.url)) {
       keepSingleBrowserTab(tab.windowId, primaryTabByWindow.get(tab.windowId) || tabId, changeInfo.url);
       return;
     }
     if (tab.windowId != null) {
-      keepSingleBrowserTab(tab.windowId, primaryTabByWindow.get(tab.windowId) || tabId, "https://yflix.to/");
+      keepSingleBrowserTab(tab.windowId, primaryTabByWindow.get(tab.windowId) || tabId, DEFAULT_BROWSER_URL);
     }
     return;
   }
-  if (changeInfo.status === "loading" && tab.url && tab.url.startsWith("https://yflix.to/watch/")) {
+  if (changeInfo.status === "loading" && tab.url && isSupportedUrl(tab.url) && /\/watch\//.test(tab.url)) {
     if (tab.windowId != null) {
       updatePrimaryTab(tab.windowId, tabId);
     }
@@ -296,13 +359,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "pageState" && tabId != null) {
+    lastStateTabId = tabId;
     const previousState = pageStateByTab.get(tabId) || {};
     const nextPageUrl = message.page_url || "";
+    const previousMetadata = previousState.metadata || {};
+    const nextMetadata = message.metadata || {};
     const previousBase = String(previousState.page_url || "").split("#")[0];
     const nextBase = String(nextPageUrl).split("#")[0];
     const previousEpisode = String(previousState.page_url || "").match(/(?:#|&)ep=(\d+,\d+)/i)?.[1] || "";
     const nextEpisode = String(nextPageUrl).match(/(?:#|&)ep=(\d+,\d+)/i)?.[1] || "";
-    if (previousBase !== nextBase || previousEpisode !== nextEpisode) {
+    const previousSeasonNumber = String(previousMetadata.season || "");
+    const nextSeasonNumber = String(nextMetadata.season || "");
+    const previousEpisodeNumber = String(previousMetadata.episode || "");
+    const nextEpisodeNumber = String(nextMetadata.episode || "");
+    const metadataEpisodeChanged =
+      previousSeasonNumber !== nextSeasonNumber || previousEpisodeNumber !== nextEpisodeNumber;
+    if (previousBase !== nextBase || previousEpisode !== nextEpisode || metadataEpisodeChanged) {
       streamsByTab.set(tabId, []);
     }
     const historyState = historyByTab.get(tabId) || { entries: [], index: -1 };
@@ -325,7 +397,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     pageStateByTab.set(tabId, {
       page_url: nextPageUrl,
       page_title: message.page_title || "",
-      metadata: message.metadata || {}
+      metadata: nextMetadata
     });
     publishState(tabId)
       .then(() => sendResponse({ ok: true }))

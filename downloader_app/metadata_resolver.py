@@ -24,6 +24,9 @@ class ResolvedMedia:
     series_year: str = ""
     season: int | None = None
     episode: int | None = None
+    youtube_id: str = ""
+    channel_id: str = ""
+    upload_date: str = ""
 
 
 def sanitize_path_segment(value: str) -> str:
@@ -35,6 +38,9 @@ def sanitize_path_segment(value: str) -> str:
 def normalize_series_title(value: str) -> str:
     base = SPACE_RE.sub(" ", (value or "").strip())
     base = re.sub(r"\s*[-|]\s*Y?Flix.*$", "", base, flags=re.IGNORECASE).strip()
+    base = re.sub(r"\s*-\s*Watch Now on Dashflix\s*$", "", base, flags=re.IGNORECASE).strip()
+    base = re.sub(r"\s*[-|]\s*DashFlix.*$", "", base, flags=re.IGNORECASE).strip()
+    base = re.sub(r"\s*[-|]\s*DopeBox.*$", "", base, flags=re.IGNORECASE).strip()
     return base or "Untitled"
 
 
@@ -144,3 +150,32 @@ class MetadataResolver:
             return int(str(value))
         except (TypeError, ValueError):
             return None
+
+    def resolve_youtube(self, metadata: dict[str, Any]) -> ResolvedMedia:
+        raw_title = str(metadata.get("title") or metadata.get("raw_title") or "Untitled")
+        channel_id = sanitize_path_segment(
+            str(
+                metadata.get("channel_id")
+                or metadata.get("uploader_id")
+                or metadata.get("uploader")
+                or "unknown-channel"
+            )
+        )
+        upload_date = re.sub(r"[^0-9]", "", str(metadata.get("upload_date") or ""))[:8]
+        if len(upload_date) != 8:
+            upload_date = "unknown-date"
+        youtube_id = str(metadata.get("youtube_id") or metadata.get("id") or "")
+        filename = f"{upload_date} - {sanitize_path_segment(raw_title)}"
+        output_template = (
+            Path("youtube")
+            / channel_id
+            / f"{filename}.%(ext)s"
+        )
+        return ResolvedMedia(
+            display_title=raw_title.strip() or "Untitled",
+            output_template=output_template,
+            media_type="youtube",
+            youtube_id=youtube_id,
+            channel_id=channel_id,
+            upload_date=upload_date,
+        )

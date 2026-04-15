@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "YFlix Stream Capture",
+  "name": "Isambard Stream Capture",
   "version": "1.0.0",
-  "description": "Captures HLS streams on yflix watch pages and queues them into the downloader app.",
+  "description": "Captures HLS streams on supported watch pages and queues them into the downloader app.",
   "permissions": ["webRequest", "tabs", "storage"],
   "host_permissions": [
     "<all_urls>"
@@ -12,7 +12,10 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://yflix.to/*"],
+      "matches": [
+        "https://yflix.to/*",
+        "https://dashflix.top/*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }

@@ -14,13 +14,12 @@ Server-side downloader stack with:
 
 `compose.yaml` in this repo now contains only the Isambard deployment stack:
 
-- `gluetun`
 - `isambard-app`
 - `isambard-guacd`
 - `isambard-guacamole`
 - `isambard-browser`
 
-Reverse proxy, DNS, Cloudflare tunnel, and other host-level services should stay outside this repo.
+Reverse proxy, DNS, Cloudflare tunnel, VPN, and other host-level services should stay outside this repo.
 
 Copy the sample environment first:
 

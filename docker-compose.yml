@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     container_name: downloader-app
     environment:
-      BROWSER_URL: http://localhost:8081
+      BROWSER_URL: http://localhost:8766
       BROWSER_USER: guac
       BROWSER_PASSWORD: guac
     ports:

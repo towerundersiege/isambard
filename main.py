@@ -5,6 +5,8 @@ import uvicorn
 from pathlib import Path
 
 from downloader_app.download_manager import DownloadManager
+from downloader_app.music_manager import MusicManager
+from downloader_app.youtube_manager import YouTubeManager
 from downloader_app.web import build_app
 
 
@@ -14,7 +16,13 @@ DOWNLOAD_MANAGER = DownloadManager(
     downloads_dir=DOWNLOADS_DIR,
     state_file=DOWNLOADS_DIR / ".task-history.json",
 )
-app = build_app(DOWNLOAD_MANAGER)
+YOUTUBE_MANAGER = YouTubeManager(
+    downloads_dir=DOWNLOADS_DIR,
+    queue_video=DOWNLOAD_MANAGER.enqueue_youtube,
+    video_status=DOWNLOAD_MANAGER.youtube_video_status,
+)
+MUSIC_MANAGER = MusicManager(data_dir=DOWNLOADS_DIR / ".music")
+app = build_app(DOWNLOAD_MANAGER, YOUTUBE_MANAGER, MUSIC_MANAGER)
 
 
 def main() -> int:

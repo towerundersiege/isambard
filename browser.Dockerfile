@@ -30,13 +30,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -s /bin/bash browser
 
 COPY browser_extension/ /opt/yflix-extension/
+COPY browser_adblock_extension/ /opt/adblock-extension/
 COPY browser/start-browser.sh /usr/local/bin/start-browser.sh
 COPY browser/openbox-rc.xml /etc/xdg/openbox/rc.xml
 
 RUN chmod +x /usr/local/bin/start-browser.sh \
     && mkdir -p /etc/chromium/policies/managed \
     && printf '%s\n' '{' '  "CommandLineFlagSecurityWarningsEnabled": false' '}' > /etc/chromium/policies/managed/managed_policies.json \
-    && chown -R browser:browser /opt/yflix-extension /home/browser
+    && chown -R browser:browser /opt/yflix-extension /opt/adblock-extension /home/browser
 
 EXPOSE 5900
 
