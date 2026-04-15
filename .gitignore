@@ -18,3 +18,6 @@ build/
 downloads/
 !.gitkeep
 *.log
+browser_adblock_extension/*
+!browser_adblock_extension/.gitkeep
+!browser_adblock_extension/README.md
