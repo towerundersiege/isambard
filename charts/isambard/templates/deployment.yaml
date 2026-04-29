@@ -49,9 +49,23 @@ spec:
             - name: VPN_TYPE
               value: {{ .Values.gluetun.env.VPN_TYPE | quote }}
             - name: WIREGUARD_PRIVATE_KEY
+              {{- if .Values.gluetun.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gluetun.existingSecret }}
+                  key: {{ .Values.gluetun.existingSecretKeys.wireguardPrivateKey }}
+              {{- else }}
               value: {{ .Values.gluetun.env.WIREGUARD_PRIVATE_KEY | quote }}
+              {{- end }}
             - name: WIREGUARD_ADDRESSES
+              {{- if .Values.gluetun.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gluetun.existingSecret }}
+                  key: {{ .Values.gluetun.existingSecretKeys.wireguardAddresses }}
+              {{- else }}
               value: {{ .Values.gluetun.env.WIREGUARD_ADDRESSES | quote }}
+              {{- end }}
           ports:
             - name: app
               containerPort: {{ .Values.service.app.targetPort }}
@@ -70,6 +84,23 @@ spec:
               value: {{ .Values.app.env.BROWSER_USER | quote }}
             - name: BROWSER_PASSWORD
               value: {{ .Values.app.env.BROWSER_PASSWORD | quote }}
+            - name: JELLYFIN_URL
+              value: {{ .Values.app.env.JELLYFIN_URL | quote }}
+            {{- if .Values.app.env.JELLYFIN_API_KEY }}
+            - name: JELLYFIN_API_KEY
+              value: {{ .Values.app.env.JELLYFIN_API_KEY | quote }}
+            {{- end }}
+            {{- if .Values.app.env.TMDB_API_KEY }}
+            - name: TMDB_API_KEY
+              value: {{ .Values.app.env.TMDB_API_KEY | quote }}
+            {{- end }}
+            {{- range .Values.app.secretEnv }}
+            - name: {{ .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .secretKey }}
+            {{- end }}
           ports:
             - name: http-app
               containerPort: 8765
@@ -120,7 +151,11 @@ spec:
             medium: Memory
             sizeLimit: {{ .Values.browser.shmSize }}
         - name: downloads
-          {{- if .Values.persistence.downloads.enabled }}
+          {{- if and .Values.persistence.downloads.enabled .Values.persistence.downloads.nfs.enabled }}
+          nfs:
+            server: {{ .Values.persistence.downloads.nfs.server | quote }}
+            path: {{ .Values.persistence.downloads.nfs.path | quote }}
+          {{- else if .Values.persistence.downloads.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "isambard.fullname" . }}-downloads
           {{- else }}

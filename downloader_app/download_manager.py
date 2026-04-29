@@ -12,13 +12,13 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .metadata_resolver import MetadataResolver
 
 
 PROGRESS_RE = re.compile(
-    r"\[download\]\s+(?P<percent>\d+(?:\.\d+)?)%(?:\s+of\s+(?P<size>\S+))?"
+    r"\[download\]\s+(?P<percent>\d+(?:\.\d+)?)%(?:\s+of\s+~?\s*(?P<size>\S+))?"
     r"(?:\s+at\s+(?P<speed>\S+))?(?:\s+ETA\s+(?P<eta>\S+))?"
 )
 LOGGER = logging.getLogger("isambard.downloads")
@@ -58,6 +58,8 @@ class DownloadTask:
     youtube_id: str = ""
     channel_id: str = ""
     upload_date: str = ""
+    poster_url: str = ""
+    backdrop_url: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -68,7 +70,12 @@ class DownloadTask:
 
 
 class DownloadManager:
-    def __init__(self, downloads_dir: Path, state_file: Path | None = None) -> None:
+    def __init__(
+        self,
+        downloads_dir: Path,
+        state_file: Path | None = None,
+        outbound_ready: Callable[[], bool] | None = None,
+    ) -> None:
         self.downloads_dir = downloads_dir
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = state_file or (self.downloads_dir / ".task-history.json")
@@ -80,8 +87,10 @@ class DownloadManager:
         self._index: dict[str, DownloadTask] = {}
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._stop_requested: set[str] = set()
+        self._pause_requested: set[str] = set()
         self._condition = threading.Condition(self._lock)
         self._running_counts: dict[str, int] = {}
+        self._outbound_ready = outbound_ready or (lambda: True)
         self._concurrency_limits = {
             "movie": _read_concurrency("MOVIE_DOWNLOAD_CONCURRENCY", 5),
             "tv": _read_concurrency("TV_DOWNLOAD_CONCURRENCY", 5),
@@ -112,6 +121,8 @@ class DownloadManager:
             series_year=resolved.series_year,
             season=resolved.season,
             episode=resolved.episode,
+            poster_url=str((metadata or {}).get("poster_url") or ""),
+            backdrop_url=str((metadata or {}).get("backdrop_url") or ""),
         )
         with self._lock:
             self._tasks.append(task)
@@ -171,7 +182,7 @@ class DownloadManager:
     def snapshot(self) -> dict[str, list[dict[str, Any]]]:
         with self._lock:
             running = [t.to_dict() for t in self._tasks if t.status == "running"]
-            queued = [t.to_dict() for t in self._tasks if t.status == "queued"]
+            queued = [t.to_dict() for t in self._tasks if t.status in {"queued", "paused"}]
             completed = [
                 t.to_dict()
                 for t in self._tasks
@@ -185,10 +196,11 @@ class DownloadManager:
             task = self._index.get(task_id)
             if task is None:
                 return None
-            if task.status == "queued":
+            if task.status in {"queued", "paused"}:
+                previous_status = task.status
                 task.status = "stopped"
                 task.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                task.error = "Stopped before download started"
+                task.error = "Stopped while paused" if previous_status == "paused" else "Stopped before download started"
                 self._delete_generated_files(task)
                 self._save_state_locked()
                 self._condition.notify_all()
@@ -218,16 +230,79 @@ class DownloadManager:
                 LOGGER.info("stopped running task id=%s title=%s", task.id, task.title)
             return task
 
+    def pause_task(self, task_id: str) -> DownloadTask | None:
+        with self._lock:
+            task = self._index.get(task_id)
+            if task is None:
+                return None
+            if task.status == "queued":
+                task.status = "paused"
+                task.error = "Paused"
+                self._save_state_locked()
+                self._condition.notify_all()
+                LOGGER.info("paused queued task id=%s title=%s", task.id, task.title)
+                return task
+            if task.status != "running":
+                return task
+            self._pause_requested.add(task_id)
+            process = self._processes.get(task_id)
+            LOGGER.info("pause requested for running task id=%s title=%s", task.id, task.title)
+
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        with self._lock:
+            task = self._index.get(task_id)
+            if task is not None and task.status == "running":
+                task.status = "paused"
+                task.finished_at = None
+                task.error = "Paused"
+                self._save_state_locked()
+                LOGGER.info("paused running task id=%s title=%s", task.id, task.title)
+            return task
+
+    def resume_task(self, task_id: str) -> DownloadTask | None:
+        with self._lock:
+            task = self._index.get(task_id)
+            if task is None:
+                return None
+            if task.status != "paused":
+                return task
+            task.status = "queued"
+            task.started_at = None
+            task.finished_at = None
+            task.error = ""
+            self._save_state_locked()
+            self._condition.notify_all()
+            LOGGER.info("resumed paused task id=%s title=%s", task.id, task.title)
+            return task
+
     def _run(self) -> None:
         while True:
             with self._condition:
                 task = self._reserve_next_task_locked()
                 while task is None:
-                    self._condition.wait()
+                    self._condition.wait(timeout=5)
                     task = self._reserve_next_task_locked()
             self._execute(task)
 
     def _execute(self, task: DownloadTask) -> None:
+        if not self._outbound_ready():
+            with self._lock:
+                task.status = "queued"
+                task.started_at = None
+                task.finished_at = None
+                task.error = "Waiting for Mullvad connection"
+                task.speed = ""
+                task.eta = ""
+                self._save_state_locked()
+                self._release_slot_locked(task)
+            LOGGER.warning("download blocked pending Mullvad task id=%s title=%s", task.id, task.title)
+            return
         yt_dlp_bin = os.environ.get("YT_DLP_BIN", "yt-dlp")
         resolved = shutil.which(yt_dlp_bin)
         if not resolved:
@@ -299,11 +374,23 @@ class DownloadManager:
         with self._lock:
             self._processes.pop(task.id, None)
             stop_requested = task.id in self._stop_requested
+            pause_requested = task.id in self._pause_requested
             if stop_requested:
                 self._stop_requested.discard(task.id)
+            if pause_requested:
+                self._pause_requested.discard(task.id)
         with self._lock:
             task.output = "\n".join(output_lines)
-            task.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            task.finished_at = None if pause_requested else datetime.now(timezone.utc).isoformat(timespec="seconds")
+            if pause_requested:
+                task.status = "paused"
+                task.error = "Paused"
+                self._save_state_locked()
+                LOGGER.info("download paused task id=%s title=%s", task.id, task.title)
+                self._apply_youtube_cooldown(task)
+                with self._lock:
+                    self._release_slot_locked(task)
+                return
             if stop_requested:
                 task.status = "stopped"
                 task.error = "Stopped by user"
@@ -425,6 +512,7 @@ class DownloadManager:
         tasks = payload.get("tasks") if isinstance(payload, dict) else None
         if not isinstance(tasks, list):
             return
+        needs_save = False
         for raw_task in tasks:
             if not isinstance(raw_task, dict):
                 continue
@@ -434,13 +522,24 @@ class DownloadManager:
                 continue
             self._tasks.append(task)
             self._index[task.id] = task
-            if task.status in {"queued", "running"}:
+            if task.status == "running":
                 task.status = "queued"
+                task.finished_at = None
+                task.error = "Resuming after app restart"
+                task.speed = ""
+                task.eta = ""
+                needs_save = True
+                LOGGER.info("requeued interrupted task id=%s title=%s", task.id, task.title)
+            elif task.status == "queued":
                 task.finished_at = None
                 task.error = ""
                 task.speed = ""
                 task.eta = ""
+                needs_save = True
                 LOGGER.info("requeued persisted task id=%s title=%s", task.id, task.title)
+        if needs_save:
+            with self._lock:
+                self._save_state_locked()
         with self._condition:
             self._condition.notify_all()
 
@@ -456,6 +555,8 @@ class DownloadManager:
         return self._concurrency_limits.get(source, self._concurrency_limits["standard"])
 
     def _reserve_next_task_locked(self) -> DownloadTask | None:
+        if not self._outbound_ready():
+            return None
         for task in self._tasks:
             if task.status != "queued":
                 continue

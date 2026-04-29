@@ -8,6 +8,9 @@ services:
       BROWSER_URL: http://localhost:8766
       BROWSER_USER: guac
       BROWSER_PASSWORD: guac
+      JELLYFIN_URL: ${JELLYFIN_URL:-}
+      JELLYFIN_API_KEY: ${JELLYFIN_API_KEY:-}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
     ports:
       - "8765:8765"
     volumes:
@@ -15,10 +18,12 @@ services:
 
   guacd:
     image: guacamole/guacd:1.6.0
+    pull_policy: always
     container_name: downloader-guacd
 
   guacamole:
     image: guacamole/guacamole:1.6.0
+    pull_policy: always
     container_name: downloader-guacamole
     depends_on:
       - guacd

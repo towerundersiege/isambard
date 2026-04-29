@@ -1,4 +1,4 @@
-{{- if .Values.persistence.downloads.enabled }}
+{{- if and .Values.persistence.downloads.enabled (not .Values.persistence.downloads.nfs.enabled) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

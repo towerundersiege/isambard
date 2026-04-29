@@ -1,5 +1,6 @@
 const streamsByTab = new Map();
 const pageStateByTab = new Map();
+const autoIntentByTab = new Map();
 const primaryTabByWindow = new Map();
 const historyByTab = new Map();
 let lastStateTabId = null;
@@ -10,9 +11,9 @@ const SUPPORTED_BASES = [
 ];
 const DEFAULT_BROWSER_URL = SUPPORTED_BASES[0];
 const queueEndpoints = [
+  "http://downloader-app:8765/api/browser/queue",
   "http://isambard-app:8765/api/browser/queue",
   "http://app:8765/api/browser/queue",
-  "http://downloader-app:8765/api/browser/queue",
   "http://127.0.0.1:8765/api/browser/queue",
   "http://localhost:8765/api/browser/queue"
 ];
@@ -38,6 +39,7 @@ function rememberStream(tabId, details) {
   const existing = streamsByTab.get(tabId) || [];
   if (!existing.find((item) => item.url === details.url)) {
     existing.unshift({ url: details.url });
+    autoQueueStream(tabId, details.url).catch(() => {});
   }
   streamsByTab.set(tabId, existing.slice(0, 20));
   publishState(tabId).catch(() => {});
@@ -47,11 +49,44 @@ function isSupportedUrl(url) {
   return typeof url === "string" && SUPPORTED_BASES.some((base) => url.startsWith(base));
 }
 
+function hasAutoIntentParams(url) {
+  try {
+    return new URL(url).searchParams.has("isambard_title");
+  } catch (_error) {
+    return false;
+  }
+}
+
+function autoIntentFromUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const params = parsed.searchParams;
+    if (!params.has("isambard_title")) {
+      return null;
+    }
+    return {
+      title: params.get("isambard_title") || params.get("keyword") || "",
+      year: params.get("isambard_year") || "",
+      media_type: params.get("isambard_media_type") || "movie",
+      season: params.get("isambard_season") || "",
+      episode: params.get("isambard_episode") || "",
+      poster_url: params.get("isambard_poster_url") || "",
+      backdrop_url: params.get("isambard_backdrop_url") || ""
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+function isAutoIntentTab(tab) {
+  return hasAutoIntentParams(tab?.url || tab?.pendingUrl || "");
+}
+
 function stateEndpoints() {
   return [
+    "http://downloader-app:8765/api/browser/state",
     "http://isambard-app:8765/api/browser/state",
     "http://app:8765/api/browser/state",
-    "http://downloader-app:8765/api/browser/state",
     "http://127.0.0.1:8765/api/browser/state",
     "http://localhost:8765/api/browser/state"
   ];
@@ -59,9 +94,9 @@ function stateEndpoints() {
 
 function commandEndpoints() {
   return [
+    "http://downloader-app:8765/api/browser/command",
     "http://isambard-app:8765/api/browser/command",
     "http://app:8765/api/browser/command",
-    "http://downloader-app:8765/api/browser/command",
     "http://127.0.0.1:8765/api/browser/command",
     "http://localhost:8765/api/browser/command"
   ];
@@ -93,7 +128,10 @@ function keepSingleBrowserTab(windowId, preferredTabId, nextUrl) {
       return;
     }
     updatePrimaryTab(windowId, primaryTab.id);
-    const extraTabs = tabs.filter((tab) => tab.id !== primaryTab.id).map((tab) => tab.id).filter((tabId) => tabId != null);
+    const extraTabs = tabs
+      .filter((tab) => tab.id !== primaryTab.id && !isAutoIntentTab(tab))
+      .map((tab) => tab.id)
+      .filter((tabId) => tabId != null);
     if (nextUrl && primaryTab.url !== nextUrl) {
       chrome.tabs.update(primaryTab.id, { url: nextUrl, active: true });
     } else {
@@ -115,6 +153,71 @@ async function postJson(endpoint, payload) {
     throw new Error(`${endpoint} returned ${response.status}`);
   }
   return response.json();
+}
+
+async function postQueuePayload(payload) {
+  let lastError = "unknown error";
+  for (const endpoint of queueEndpoints) {
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) {
+        lastError = `${endpoint} returned ${response.status}`;
+        continue;
+      }
+      return response.json();
+    } catch (error) {
+      lastError = String(error);
+    }
+  }
+  throw new Error(lastError);
+}
+
+async function autoQueueStream(tabId, streamUrl) {
+  const intentState = autoIntentByTab.get(tabId);
+  if (!intentState || intentState.queued || !streamUrl) {
+    return;
+  }
+  intentState.queued = true;
+  autoIntentByTab.set(tabId, intentState);
+  const pageState = pageStateByTab.get(tabId) || {};
+  const pageMetadata = pageState.metadata || {};
+  const intent = intentState.intent || {};
+  const metadata = {
+    ...pageMetadata,
+    raw_title: intent.title || pageMetadata.raw_title || pageState.page_title || "Detected stream",
+    series_name: intent.title || pageMetadata.series_name || pageMetadata.raw_title || "",
+    year: intent.year || pageMetadata.year || null,
+    season: intent.season || pageMetadata.season || null,
+    episode: intent.episode || pageMetadata.episode || null,
+    media_type: intent.media_type || pageMetadata.media_type || "movie",
+    poster_url: intent.poster_url || pageMetadata.poster_url || "",
+    backdrop_url: intent.backdrop_url || pageMetadata.backdrop_url || "",
+    page_url: pageState.page_url || ""
+  };
+  try {
+    await postQueuePayload({
+      title: normalizeTitle(metadata),
+      url: streamUrl,
+      metadata
+    });
+    if (intentState.closeWhenQueued) {
+      setTimeout(() => {
+        chrome.tabs.remove(tabId, () => {
+          if (chrome.runtime.lastError) {
+            console.warn("auto tab close warning", chrome.runtime.lastError.message);
+          }
+        });
+      }, 1200);
+    }
+  } catch (error) {
+    intentState.queued = false;
+    autoIntentByTab.set(tabId, intentState);
+    throw error;
+  }
 }
 
 async function publishState(tabId) {
@@ -196,11 +299,54 @@ function executeBrowserNavigation(url) {
         resolve(false);
         return;
       }
+      if (hasAutoIntentParams(url)) {
+        const prepareAutoTab = (autoTabId, closeWhenQueued) => {
+          if (autoTabId != null) {
+            const intent = autoIntentFromUrl(url);
+            if (intent) {
+              autoIntentByTab.set(autoTabId, { intent, queued: false, closeWhenQueued: !!closeWhenQueued });
+            }
+            lastStateTabId = autoTabId;
+            streamsByTab.set(autoTabId, []);
+            historyByTab.set(autoTabId, { entries: [url], index: 0 });
+            pageStateByTab.set(autoTabId, {
+              page_url: url,
+              page_title: "",
+              metadata: {}
+            });
+            publishState(autoTabId).catch(() => {});
+          }
+        };
+        const navigateCurrentTab = () => {
+          chrome.tabs.update(tab.id, { url, active: true }, () => {
+            if (chrome.runtime.lastError) {
+              console.warn("auto navigation update warning", chrome.runtime.lastError.message);
+              resolve(false);
+              return;
+            }
+            prepareAutoTab(tab.id, false);
+            resolve(true);
+          });
+        };
+        chrome.tabs.create({ windowId: tab.windowId, url, active: false }, (createdTab) => {
+          if (chrome.runtime.lastError) {
+            console.warn("auto navigation create warning", chrome.runtime.lastError.message);
+            navigateCurrentTab();
+            return;
+          }
+          prepareAutoTab(createdTab?.id, true);
+          resolve(true);
+        });
+        return;
+      }
       if (tab.windowId != null) {
         updatePrimaryTab(tab.windowId, tab.id);
       }
       lastStateTabId = tab.id;
       streamsByTab.set(tab.id, []);
+      if (!hasAutoIntentParams(url)) {
+        autoIntentByTab.delete(tab.id);
+      }
       historyByTab.set(tab.id, { entries: [url], index: 0 });
       pageStateByTab.set(tab.id, {
         page_url: url,
@@ -285,6 +431,7 @@ chrome.webRequest.onBeforeRequest.addListener(
 chrome.tabs.onRemoved.addListener((tabId) => {
   streamsByTab.delete(tabId);
   pageStateByTab.delete(tabId);
+  autoIntentByTab.delete(tabId);
   historyByTab.delete(tabId);
   for (const [windowId, primaryTabId] of primaryTabByWindow.entries()) {
     if (primaryTabId === tabId) {
@@ -295,6 +442,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.tabs.onCreated.addListener((tab) => {
   if (tab.windowId == null) {
+    return;
+  }
+  if (isAutoIntentTab(tab)) {
     return;
   }
   keepSingleBrowserTab(tab.windowId, primaryTabByWindow.get(tab.windowId), null);
@@ -326,6 +476,13 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     lastStateTabId = tabId;
   }
   if (changeInfo.url) {
+    const keepsAutoIntent =
+      autoIntentByTab.has(tabId) &&
+      isSupportedUrl(changeInfo.url) &&
+      /\/watch\//.test(changeInfo.url);
+    if (!hasAutoIntentParams(changeInfo.url) && !keepsAutoIntent) {
+      autoIntentByTab.delete(tabId);
+    }
     if (isSupportedUrl(changeInfo.url)) {
       keepSingleBrowserTab(tab.windowId, primaryTabByWindow.get(tab.windowId) || tabId, changeInfo.url);
       return;
@@ -405,36 +562,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "autoIntent" && tabId != null) {
+    const existing = autoIntentByTab.get(tabId) || {};
+    autoIntentByTab.set(tabId, {
+      intent: message.intent || {},
+      queued: false,
+      closeWhenQueued: !!existing.closeWhenQueued
+    });
+    sendResponse({ ok: true });
+    return true;
+  }
+
   if (message.type === "queueStream") {
     const streamUrl = message.url;
     const metadata = message.metadata || {};
-    const payload = JSON.stringify({
+    const payload = {
       title: normalizeTitle(metadata),
       url: streamUrl,
       metadata
-    });
-    (async () => {
-      let lastError = "unknown error";
-      for (const endpoint of queueEndpoints) {
-        try {
-          const response = await fetch(endpoint, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: payload
-          });
-          if (!response.ok) {
-            lastError = `${endpoint} returned ${response.status}`;
-            continue;
-          }
-          const task = await response.json();
-          sendResponse({ ok: true, task });
-          return;
-        } catch (error) {
-          lastError = String(error);
-        }
-      }
-      sendResponse({ ok: false, error: lastError });
-    })();
+    };
+    postQueuePayload(payload)
+      .then((task) => sendResponse({ ok: true, task }))
+      .catch((error) => sendResponse({ ok: false, error: String(error) }));
     return true;
   }
 

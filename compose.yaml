@@ -1,6 +1,7 @@
 services:
   isambard-app:
-    image: isambard-app:latest
+    image: ghcr.io/towerundersiege/isambard-app:latest
+    pull_policy: always
     platform: linux/amd64
     container_name: isambard-app
     restart: unless-stopped
@@ -14,17 +15,22 @@ services:
       - BROWSER_URL=${ISAMBARD_BROWSER_URL:-http://localhost:${ISAMBARD_BROWSER_PORT:-8766}}
       - BROWSER_USER=${ISAMBARD_BROWSER_USER:-guac}
       - BROWSER_PASSWORD=${ISAMBARD_BROWSER_PASSWORD:-guac}
+      - JELLYFIN_URL=${JELLYFIN_URL:-}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
     volumes:
       - /data/crimson/media:/app/downloads
 
   isambard-guacd:
     image: guacamole/guacd:1.6.0
+    pull_policy: always
     platform: linux/amd64
     container_name: isambard-guacd
     restart: unless-stopped
 
   isambard-guacamole:
     image: guacamole/guacamole:1.6.0
+    pull_policy: always
     platform: linux/amd64
     container_name: isambard-guacamole
     restart: unless-stopped
@@ -40,7 +46,8 @@ services:
       - /data/crimson/config/isambard/guacamole/user-mapping.xml:/etc/guacamole/user-mapping.xml:ro
 
   isambard-browser:
-    image: isambard-browser:latest
+    image: ghcr.io/towerundersiege/isambard-browser:latest
+    pull_policy: always
     platform: linux/amd64
     container_name: isambard-browser
     restart: unless-stopped

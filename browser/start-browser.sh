@@ -19,6 +19,31 @@ sleep 1
 
 x11vnc -display :0 -forever -shared -rfbport 5900 -passwd browserpass -xkb -repeat -wait 10 -noxdamage -noxfixes -noxrandr &
 
+wait_for_mullvad() {
+  while true; do
+    if python3 - <<'PY'
+import json
+import sys
+import urllib.request
+
+try:
+    with urllib.request.urlopen("https://am.i.mullvad.net/json", timeout=5) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+except Exception:
+    sys.exit(1)
+
+sys.exit(0 if payload.get("mullvad_exit_ip") else 1)
+PY
+    then
+      break
+    fi
+    echo "Waiting for Mullvad connection before launching Chromium..."
+    sleep 5
+  done
+}
+
+wait_for_mullvad
+
 exec su -s /bin/bash browser -c '
 export DISPLAY=:0
 export HOME=/home/browser
@@ -42,12 +67,12 @@ while true; do
     --no-first-run \
     --no-default-browser-check \
     --autoplay-policy=no-user-gesture-required \
-    --disable-features=TabHoverCardImages,TabGroupsSave,SidePanelPinning \
+    --disable-features=HttpsUpgrades,HttpsFirstModeV2,HttpsFirstBalancedModeAutoEnable,TabHoverCardImages,TabGroupsSave,SidePanelPinning \
     --disable-session-crashed-bubble \
     --window-position=0,0 \
     --window-size=1024,576 \
     --disable-extensions-except="${EXTENSION_PATHS}" \
     --load-extension="${EXTENSION_PATHS}" \
-    --app=https://yflix.to || true
+    https://yflix.to || true
   sleep 2
 done'

@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import urllib.error
 import urllib.request
@@ -13,13 +14,17 @@ import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi import HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .download_manager import DownloadManager
+from .media_catalog import MediaCatalog
+from .metadata_resolver import sanitize_path_segment
 from .music_manager import MusicManager
 from .music_web import install_music
+from .vpn import MullvadGuard
 from .youtube_manager import YouTubeManager
 
 
@@ -68,10 +73,31 @@ class YouTubeSubscribeRequest(BaseModel):
     cache_key: str
 
 
+class MediaAutoFindRequest(BaseModel):
+    title: str
+    year: str = ""
+    media_type: str = "movie"
+    site: str = "yflix"
+    season: int | None = None
+    episode: int | None = None
+    poster_url: str = ""
+    backdrop_url: str = ""
+
+
+class MediaLocalStatusRequest(BaseModel):
+    title: str
+    year: str = ""
+    media_type: str = "movie"
+    season: int | None = None
+    episode: int | None = None
+
+
 def build_app(
     download_manager: DownloadManager,
     youtube_manager: YouTubeManager,
     music_manager: MusicManager,
+    mullvad_guard: MullvadGuard,
+    media_catalog: MediaCatalog,
 ) -> FastAPI:
     app = FastAPI(title="Downloader")
     app.mount("/extension", StaticFiles(directory=EXTENSION_DIR), name="extension")
@@ -85,9 +111,25 @@ def build_app(
         "can_go_forward": False,
         "site": "yflix",
     }
-    app.state.browser_command = {"id": 0, "action": "", "value": ""}
+    app.state.browser_command_sequence = int(time.time() * 1000)
+    app.state.browser_command = {"id": app.state.browser_command_sequence, "action": "", "value": ""}
 
-    def render_page(active_page: str) -> str:
+    def next_browser_command_id() -> int:
+        app.state.browser_command_sequence = max(
+            int(app.state.browser_command.get("id", 0)),
+            int(app.state.browser_command_sequence),
+            int(time.time() * 1000),
+        ) + 1
+        return app.state.browser_command_sequence
+
+    def require_mullvad(context: str) -> None:
+        try:
+            mullvad_guard.assert_connected(context)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    def render_page(active_page: str, media_view: str = "discover") -> str:
+        normalized_media_view = media_view if media_view in {"discover", "library", "download"} else "discover"
         browser_port = os.environ.get("ISAMBARD_BROWSER_PORT", "8766")
         browser_url = _build_browser_embed_url(
             os.environ.get("BROWSER_URL", f"http://localhost:{browser_port}"),
@@ -111,6 +153,7 @@ def build_app(
             .replace("__YOUTUBE_PAGE_CLASS__", "page is-active" if active_page == "youtube" else "page")
             .replace("__MUSIC_PAGE_CLASS__", "page is-active" if active_page == "music" else "page")
             .replace("__SETTINGS_PAGE_CLASS__", "page is-active" if active_page == "settings" else "page")
+            .replace("__INITIAL_MEDIA_VIEW__", normalized_media_view)
         )
 
     @app.get("/", include_in_schema=False)
@@ -123,7 +166,19 @@ def build_app(
 
     @app.get("/movies-tv", response_class=HTMLResponse)
     def movies_tv_page() -> str:
-        return render_page("library")
+        return render_page("library", "discover")
+
+    @app.get("/movies-tv/discover", response_class=HTMLResponse)
+    def movies_tv_discover_page() -> str:
+        return render_page("library", "discover")
+
+    @app.get("/movies-tv/library", response_class=HTMLResponse)
+    def movies_tv_library_page() -> str:
+        return render_page("library", "library")
+
+    @app.get("/movies-tv/download", response_class=HTMLResponse)
+    def movies_tv_download_page() -> str:
+        return render_page("library", "download")
 
     @app.get("/youtube", response_class=HTMLResponse)
     def youtube_page() -> str:
@@ -149,6 +204,7 @@ def build_app(
 
     @app.post("/api/browser/queue")
     def create_browser_task(request: QueueRequest) -> dict:
+        require_mullvad("Browser capture queueing")
         LOGGER.info("browser queue task title=%s url=%s", request.title, request.url)
         task = download_manager.enqueue(request.title, request.url, request.metadata)
         return task.to_dict()
@@ -161,6 +217,26 @@ def build_app(
             LOGGER.warning("stop task failed id=%s reason=not_found", task_id)
             return {"ok": False, "error": "task not found"}
         LOGGER.info("task stop result id=%s status=%s", task_id, task.status)
+        return {"ok": True, "task": task.to_dict()}
+
+    @app.post("/api/tasks/{task_id}/pause")
+    def pause_task(task_id: str) -> dict:
+        LOGGER.info("api pause task id=%s", task_id)
+        task = download_manager.pause_task(task_id)
+        if task is None:
+            LOGGER.warning("pause task failed id=%s reason=not_found", task_id)
+            return {"ok": False, "error": "task not found"}
+        LOGGER.info("task pause result id=%s status=%s", task_id, task.status)
+        return {"ok": True, "task": task.to_dict()}
+
+    @app.post("/api/tasks/{task_id}/resume")
+    def resume_task(task_id: str) -> dict:
+        LOGGER.info("api resume task id=%s", task_id)
+        task = download_manager.resume_task(task_id)
+        if task is None:
+            LOGGER.warning("resume task failed id=%s reason=not_found", task_id)
+            return {"ok": False, "error": "task not found"}
+        LOGGER.info("task resume result id=%s status=%s", task_id, task.status)
         return {"ok": True, "task": task.to_dict()}
 
     @app.get("/api/browser/state")
@@ -185,6 +261,16 @@ def build_app(
             "can_go_forward": request.can_go_forward,
             "site": _site_from_url(request.page_url),
         }
+        command = app.state.browser_command
+        command_value = str(command.get("value") or "")
+        if (
+            command.get("action") == "navigate"
+            and command_value
+            and _browser_target_matches(command_value, request.page_url)
+            and request.page_url
+        ):
+            app.state.browser_command = {"id": command.get("id", 0), "action": "", "value": ""}
+            LOGGER.info("cleared browser navigate command id=%s from browser state", command.get("id", 0))
         return {"ok": True}
 
     @app.get("/api/browser/command")
@@ -193,21 +279,23 @@ def build_app(
 
     @app.post("/api/browser/command/{action}")
     def issue_browser_command(action: str) -> dict:
+        require_mullvad("Browser navigation")
         if action not in {"back", "forward", "reload"}:
             LOGGER.warning("unsupported browser command action=%s", action)
             return {"ok": False, "error": "unsupported action"}
-        current_id = int(app.state.browser_command.get("id", 0)) + 1
+        current_id = next_browser_command_id()
         app.state.browser_command = {"id": current_id, "action": action, "value": ""}
         LOGGER.info("issued browser command id=%s action=%s", current_id, action)
         return {"ok": True, "id": current_id, "action": action}
 
     @app.post("/api/browser/navigate")
     def navigate_browser(request: BrowserNavigateRequest) -> dict:
+        require_mullvad("Browser navigation")
         target = BROWSER_SITES.get(request.site)
         if not target:
             LOGGER.warning("unsupported browser site site=%s", request.site)
             return {"ok": False, "error": "unsupported site"}
-        current_id = int(app.state.browser_command.get("id", 0)) + 1
+        current_id = next_browser_command_id()
         app.state.browser_command = {"id": current_id, "action": "navigate", "value": target}
         LOGGER.info("issued browser navigate id=%s site=%s target=%s", current_id, request.site, target)
         return {"ok": True, "id": current_id, "action": "navigate", "value": target}
@@ -239,28 +327,119 @@ def build_app(
 
     @app.get("/api/settings/general")
     def general_settings_status() -> dict:
-        return {"mullvad": _mullvad_status()}
+        return {"mullvad": mullvad_guard.status(force=True)}
+
+    @app.get("/api/system/summary")
+    def system_summary() -> dict:
+        usage = shutil.disk_usage(download_manager.downloads_dir)
+        return {
+            "downloads_path": str(download_manager.downloads_dir),
+            "mullvad": mullvad_guard.status(force=True),
+            "disk": {
+                "total": usage.total,
+                "used": usage.used,
+                "free": usage.free,
+            },
+            **media_catalog.summary(),
+        }
+
+    @app.get("/api/media/discover")
+    def media_discover(query: str = "") -> dict:
+        try:
+            return media_catalog.discover(query)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.get("/api/media/library")
+    def media_library(query: str = "") -> dict:
+        try:
+            return media_catalog.library(query)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.get("/api/media/details")
+    def media_details(provider: str, provider_id: str, media_type: str = "movie") -> dict:
+        try:
+            return media_catalog.details(provider, provider_id, media_type)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.get("/api/media/jellyfin/image/{item_id}/{image_type}")
+    def media_jellyfin_image(item_id: str, image_type: str, max_width: int | None = None) -> Response:
+        try:
+            payload, content_type = media_catalog.stream_jellyfin_image(item_id, image_type, max_width=max_width)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return Response(content=payload, media_type=content_type)
+
+    @app.post("/api/media/local-status")
+    def media_local_status(request: MediaLocalStatusRequest) -> dict:
+        status = _local_media_status(download_manager.downloads_dir, request)
+        if status.get("exists"):
+            status["jellyfin_url"] = media_catalog.jellyfin_url_for(
+                request.title,
+                year=request.year,
+                media_type=request.media_type,
+                season=request.season,
+                episode=request.episode,
+            )
+        return status
+
+    @app.post("/api/media/auto-find")
+    def media_auto_find(request: MediaAutoFindRequest) -> dict:
+        require_mullvad("Browser auto-find")
+        payload = media_catalog.auto_find_payload(
+            request.title,
+            year=request.year,
+            media_type=request.media_type,
+            site=request.site,
+            season=request.season,
+            episode=request.episode,
+            poster_url=request.poster_url,
+            backdrop_url=request.backdrop_url,
+        )
+        current_id = next_browser_command_id()
+        app.state.browser_command = {
+            "id": current_id,
+            "action": "navigate",
+            "value": payload["target_url"],
+        }
+        LOGGER.info(
+            "issued browser auto-find id=%s title=%s site=%s target=%s",
+            current_id,
+            request.title,
+            request.site,
+            payload["target_url"],
+        )
+        return {
+            **payload,
+            "browser_command_id": current_id,
+        }
 
     @app.post("/api/youtube/lookup")
     def youtube_lookup(request: YouTubeLookupRequest) -> dict:
+        require_mullvad("YouTube lookup")
         LOGGER.info("youtube lookup url=%s refresh=%s", request.url, request.refresh)
         lookup = youtube_manager.lookup(request.url, request.refresh)
         return lookup.to_dict()
 
     @app.post("/api/youtube/queue")
     def youtube_queue(request: YouTubeQueueRequest) -> dict:
+        require_mullvad("YouTube queueing")
         LOGGER.info("youtube queue cache_key=%s count=%s", request.cache_key, len(request.video_ids))
         queued = youtube_manager.queue_selected(request.cache_key, request.video_ids)
         return {"ok": True, "queued": queued}
 
     @app.post("/api/youtube/subscribe")
     def youtube_subscribe(request: YouTubeSubscribeRequest) -> dict:
+        require_mullvad("YouTube subscriptions")
         subscription = youtube_manager.subscribe(request.cache_key)
         LOGGER.info("youtube subscribed cache_key=%s subscription_id=%s", request.cache_key, subscription["id"])
         return {"ok": True, "subscription": subscription}
 
     @app.post("/api/youtube/subscriptions/{subscription_id}/refresh")
     def refresh_youtube_subscription(subscription_id: str) -> dict:
+        require_mullvad("YouTube subscription refresh")
         LOGGER.info("youtube subscription refresh id=%s", subscription_id)
         return youtube_manager.refresh_subscription(subscription_id)
 
@@ -278,6 +457,55 @@ def _site_from_url(url: str) -> str:
     if lowered.startswith("https://dashflix.top/"):
         return "dashflix"
     return "yflix"
+
+
+def _browser_target_matches(command_url: str, page_url: str) -> bool:
+    if not command_url or not page_url:
+        return False
+    command = urlsplit(command_url)
+    page = urlsplit(page_url)
+    return (
+        command.scheme.lower() == page.scheme.lower()
+        and command.netloc.lower() == page.netloc.lower()
+        and (command.path or "/") == (page.path or "/")
+        and sorted(parse_qsl(command.query, keep_blank_values=True))
+        == sorted(parse_qsl(page.query, keep_blank_values=True))
+        and command.fragment == page.fragment
+    )
+
+
+def _local_media_status(downloads_dir: Path, request: MediaLocalStatusRequest) -> dict:
+    title = (request.title or "").strip()
+    year = (request.year or "").strip()
+    display_title = f"{title} ({year})" if title and year and f"({year})" not in title else title
+    media_type = (request.media_type or "movie").strip().lower()
+    if not display_title:
+        return {"exists": False, "path": ""}
+
+    if media_type == "tv":
+        show_dir = downloads_dir / "tv" / sanitize_path_segment(display_title)
+        if request.season and request.episode:
+            filename = f"{display_title} - S{request.season:02d}E{request.episode:02d}.mp4"
+            path = (
+                show_dir
+                / sanitize_path_segment(f"{display_title} - S{request.season:02d}")
+                / sanitize_path_segment(filename)
+            )
+            return {"exists": path.is_file(), "path": str(path) if path.exists() else ""}
+        if request.season:
+            season_dir = show_dir / sanitize_path_segment(f"{display_title} - S{request.season:02d}")
+            exists = season_dir.is_dir() and any(season_dir.glob("*.mp4"))
+            return {"exists": exists, "path": str(season_dir) if season_dir.exists() else ""}
+        exists = show_dir.is_dir() and any(show_dir.glob("*/*.mp4"))
+        return {"exists": exists, "path": str(show_dir) if show_dir.exists() else ""}
+
+    movie_path = (
+        downloads_dir
+        / "movies"
+        / sanitize_path_segment(display_title)
+        / f"{sanitize_path_segment(display_title)}.mp4"
+    )
+    return {"exists": movie_path.is_file(), "path": str(movie_path) if movie_path.exists() else ""}
 
 
 def _browser_site_options(selected_site: str) -> str:
@@ -300,61 +528,6 @@ def _build_browser_embed_url(base_url: str, username: str, password: str) -> str
     query.setdefault("preventSleep", "true")
     query.setdefault("resize", "display-update")
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-
-
-def _mullvad_status() -> dict:
-    try:
-        with urllib.request.urlopen("https://am.i.mullvad.net/json", timeout=5) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        LOGGER.warning("failed to read mullvad endpoint: %s", exc)
-        if shutil.which("mullvad") is None:
-            return {
-                "available": False,
-                "connected": False,
-                "summary": "Unable to reach Mullvad status endpoint",
-            }
-        try:
-            result = subprocess.run(
-                ["mullvad", "status"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except Exception as cli_exc:
-            LOGGER.warning("failed to read mullvad status: %s", cli_exc)
-            return {
-                "available": False,
-                "connected": False,
-                "summary": "Unable to read Mullvad status",
-            }
-        output = (result.stdout or result.stderr or "").strip()
-        lowered = output.lower()
-        connected = "connected" in lowered and "disconnected" not in lowered
-        if not output:
-            output = "Mullvad status unavailable"
-        return {
-            "available": True,
-            "connected": connected,
-            "summary": output,
-        }
-    connected = bool(payload.get("mullvad_exit_ip"))
-    ip = payload.get("ip") or "Unknown IP"
-    location = ", ".join(
-        part for part in [payload.get("city"), payload.get("country")] if isinstance(part, str) and part
-    )
-    organization = payload.get("organization") or ""
-    summary_parts = [f"IP: {ip}"]
-    if location:
-        summary_parts.append(f"Location: {location}")
-    if organization:
-        summary_parts.append(f"Org: {organization}")
-    return {
-        "available": True,
-        "connected": connected,
-        "summary": "\n".join(summary_parts),
-    }
 
 
 INDEX_HTML = """
@@ -393,9 +566,9 @@ INDEX_HTML = """
         linear-gradient(180deg, #071019 0%, #0b1521 100%);
     }
     .shell {
-      width: calc(100vw - 32px);
-      margin: 16px auto;
-      padding-bottom: 16px;
+      width: 100vw;
+      margin: 0;
+      padding-bottom: 0;
     }
     .header {
       margin-bottom: 16px;
@@ -799,6 +972,21 @@ INDEX_HTML = """
       align-content: start;
       min-height: 220px;
     }
+    .settings-storage {
+      display: grid;
+      gap: 12px;
+    }
+    .settings-storage-top {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .settings-storage-value {
+      font-size: 32px;
+      font-weight: 800;
+      letter-spacing: -0.05em;
+    }
     .settings-card.empty-card {
       color: var(--muted);
     }
@@ -846,14 +1034,14 @@ INDEX_HTML = """
     .panel {
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 24px;
+      border-radius: 16px;
       overflow: hidden;
       backdrop-filter: blur(18px);
       box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
     }
     .panel-header {
-      padding: 12px 16px;
-      min-height: 58px;
+      padding: 10px 16px;
+      min-height: 56px;
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
@@ -884,6 +1072,8 @@ INDEX_HTML = """
       aspect-ratio: 16 / 9;
       min-height: 0;
       overflow: hidden;
+      position: relative;
+      background: rgba(8, 14, 24, 0.92);
     }
     .browser-wrap {
       display: grid;
@@ -943,9 +1133,53 @@ INDEX_HTML = """
       overscroll-behavior: contain;
       touch-action: pan-x pan-y pinch-zoom;
     }
+    .browser-frame.is-hidden {
+      visibility: hidden;
+    }
     .browser-frame:focus {
       outline: 2px solid rgba(15,123,255,0.9);
       outline-offset: -2px;
+    }
+    .browser-blocked {
+      position: absolute;
+      inset: 0;
+      display: none;
+      place-items: center;
+      padding: 24px;
+      text-align: center;
+      background:
+        radial-gradient(circle at 50% 0%, rgba(239,68,68,0.14), transparent 35%),
+        linear-gradient(180deg, rgba(7,16,25,0.92), rgba(7,16,25,0.98));
+    }
+    .browser-blocked.is-visible {
+      display: grid;
+    }
+    .browser-blocked-card {
+      max-width: 420px;
+      display: grid;
+      gap: 12px;
+      justify-items: center;
+    }
+    .browser-blocked-icon {
+      width: 72px;
+      height: 72px;
+      border-radius: 22px;
+      display: grid;
+      place-items: center;
+      font-size: 28px;
+      color: #ffb6ae;
+      background: rgba(239,68,68,0.12);
+      border: 1px solid rgba(239,68,68,0.24);
+    }
+    .browser-blocked-title {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+    }
+    .browser-blocked-copy {
+      color: var(--text-muted);
+      line-height: 1.5;
+      font-size: 14px;
     }
     .stream-panel {
       align-self: stretch;
@@ -1407,96 +1641,1898 @@ INDEX_HTML = """
         width: 100%;
       }
     }
+    :root {
+      --bg-base: #071019;
+      --surface-1: rgba(13, 23, 38, 0.9);
+      --surface-2: rgba(16, 29, 49, 0.92);
+      --surface-3: rgba(255,255,255,0.04);
+      --surface-4: rgba(255,255,255,0.02);
+      --text-strong: #f4f7fb;
+      --text-muted: #8fa3bf;
+      --border-soft: rgba(255,255,255,0.08);
+      --accent-blue: #1da1ff;
+      --accent-teal: #00d4b8;
+      --accent-violet: #8b5cf6;
+      --accent-green: #22c55e;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --radius-lg: 24px;
+      --radius-md: 18px;
+      --shadow-lg: 0 24px 80px rgba(0, 0, 0, 0.28);
+    }
+    body {
+      min-height: 100vh;
+      color: var(--text-strong);
+      background:
+        radial-gradient(circle at 78% 10%, rgba(29,161,255,0.16), transparent 22%),
+        radial-gradient(circle at 56% 0%, rgba(139,92,246,0.13), transparent 18%),
+        radial-gradient(circle at 0% 100%, rgba(0,212,184,0.10), transparent 22%),
+        #071019;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.22;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+      background-size: 28px 28px;
+      mask-image: radial-gradient(circle at center, black 30%, transparent 88%);
+    }
+    .mobile-nav-toggle {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 40;
+      display: none;
+      border: 1px solid var(--border-soft);
+      border-radius: 14px;
+      padding: 10px 14px;
+      background: rgba(13, 23, 38, 0.96);
+      color: var(--text-strong);
+      box-shadow: var(--shadow-lg);
+    }
+    .shell.shell-premium {
+      width: 100%;
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 0;
+      align-items: start;
+    }
+    .sidebar,
+    .panel,
+    .sidebar-card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02));
+      border: 1px solid var(--border-soft);
+      backdrop-filter: blur(18px);
+      box-shadow: var(--shadow-lg);
+    }
+    .sidebar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 244px;
+      min-height: 100vh;
+      border-radius: 0;
+      padding: 18px 16px 16px;
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 16px;
+      align-self: start;
+      overflow-y: auto;
+    }
+    .sidebar.is-collapsed {
+      width: 84px;
+      padding-inline: 16px;
+    }
+    .sidebar.is-collapsed .brand-meta,
+    .sidebar.is-collapsed .nav-label,
+    .sidebar.is-collapsed .nav-item span:last-child,
+    .sidebar.is-collapsed .sidebar-collapse-label {
+      display: none;
+    }
+    .sidebar.is-collapsed .sidebar-nav {
+      justify-items: stretch;
+    }
+    .brand-block {
+      display: flex;
+      gap: 14px;
+      align-items: center;
+      justify-content: flex-start;
+    }
+    .brand-meta {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+    .brand-mark {
+      width: 52px;
+      height: 52px;
+      border-radius: 18px;
+      display: grid;
+      place-items: center;
+      font-size: 20px;
+      font-weight: 800;
+      color: white;
+      background: linear-gradient(135deg, var(--accent-blue), var(--accent-violet));
+      box-shadow: 0 12px 30px rgba(29,161,255,0.3);
+    }
+    .brand-title {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: -0.03em;
+    }
+    .sidebar-collapse-btn {
+      width: auto;
+      height: auto;
+      border-radius: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      display: flex;
+      place-items: unset;
+      cursor: pointer;
+      flex: 0 0 auto;
+      box-shadow: none;
+      padding: 0;
+      font: inherit;
+      text-align: left;
+    }
+    .sidebar-collapse-btn:hover {
+      color: var(--text-strong);
+      background: transparent;
+    }
+    .nav-section {
+      display: grid;
+      gap: 8px;
+    }
+    .nav-label,
+    .stat-label,
+    .eyebrow,
+    .sidebar-card-label {
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+    .sidebar-nav {
+      display: grid;
+      gap: 6px;
+    }
+    .nav-item {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      padding: 10px 6px 10px 11px;
+      border-radius: 12px;
+      text-decoration: none;
+      color: var(--text-muted);
+      background: transparent;
+      border: 0;
+      transition: color 180ms ease, transform 180ms ease;
+    }
+    .sidebar.is-collapsed .nav-item {
+      justify-content: flex-start;
+      width: 100%;
+      padding-inline: 11px 6px;
+    }
+    .nav-item:hover,
+    .nav-item[aria-selected="true"] {
+      color: var(--text-strong);
+      transform: translateY(-1px);
+    }
+    .nav-item[aria-selected="true"] {
+      font-weight: 800;
+    }
+    .nav-item-passive {
+      opacity: 0.68;
+      cursor: default;
+    }
+    .nav-icon {
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      display: inline-grid;
+      place-items: center;
+      color: currentColor;
+      background: transparent;
+      flex: 0 0 auto;
+    }
+    .nav-item[aria-selected="true"] .nav-icon {
+      color: var(--accent-blue);
+    }
+    .sidebar-collapse-btn .nav-icon {
+      color: currentColor;
+    }
+    .nav-icon svg,
+    .utility-chip-icon svg,
+    .storage-card-icon svg,
+    .brand-mark svg {
+      width: 20px;
+      height: 20px;
+      display: block;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .sidebar-footer {
+      align-self: end;
+      display: grid;
+      gap: 8px;
+      position: sticky;
+      bottom: 0;
+      padding-top: 16px;
+      background: transparent;
+    }
+    .sidebar-footer-bottom {
+      display: grid;
+      gap: 8px;
+      justify-items: stretch;
+    }
+    .mullvad-banner {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 16px;
+      border-radius: 16px;
+      border: 1px solid rgba(239,68,68,0.24);
+      background: rgba(239,68,68,0.12);
+      color: #ffd2cc;
+    }
+    .mullvad-banner.is-visible {
+      display: flex;
+    }
+    .mullvad-banner-title {
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }
+    .mullvad-banner-copy {
+      color: rgba(255,210,204,0.86);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .storage-card-icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 10px;
+      display: inline-grid;
+      place-items: center;
+      color: var(--text-strong);
+      background: rgba(255,255,255,0.08);
+    }
+    .storage-progress {
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.07);
+      overflow: hidden;
+    }
+    .storage-progress > span {
+      display: block;
+      height: 100%;
+      width: 0%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--accent-blue), var(--accent-teal));
+      box-shadow: 0 0 18px rgba(29,161,255,0.28);
+    }
+    .storage-progress-label {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .sidebar-card strong {
+      font-size: 16px;
+      letter-spacing: -0.02em;
+    }
+    .sidebar-card span:last-child {
+      color: var(--text-muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .app-main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 12px;
+      min-width: 0;
+      margin-left: 244px;
+      padding: 8px 10px 10px;
+    }
+    body.sidebar-collapsed .app-main {
+      margin-left: 84px;
+    }
+    .search-input {
+      width: 100%;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 16px;
+      padding: 14px 16px;
+      background: rgba(255,255,255,0.04);
+      color: var(--text-strong);
+      font-size: 14px;
+    }
+    .search-input:focus,
+    .youtube-input:focus,
+    .music-input:focus,
+    .browser-site-select:focus,
+    .youtube-btn:focus,
+    .music-btn:focus,
+    .browser-btn:focus {
+      outline: 2px solid rgba(29,161,255,0.8);
+      outline-offset: 2px;
+    }
+    .panel-toolbar,
+    .quick-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .page {
+      display: none;
+    }
+    .page.is-active {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 10px;
+      min-width: 0;
+    }
+    .page-hero {
+      position: relative;
+      overflow: hidden;
+      border-radius: 16px;
+      padding: 26px 28px;
+      background:
+        radial-gradient(circle at 70% 18%, rgba(29,161,255,0.26), transparent 18%),
+        radial-gradient(circle at 83% 18%, rgba(139,92,246,0.28), transparent 16%),
+        linear-gradient(135deg, rgba(10, 27, 52, 0.92), rgba(12, 22, 39, 0.86));
+      border: 1px solid rgba(255,255,255,0.08);
+      box-shadow: var(--shadow-lg);
+    }
+    .page-hero::after {
+      content: "";
+      position: absolute;
+      top: 18px;
+      right: 88px;
+      width: 320px;
+      height: 72px;
+      background:
+        radial-gradient(circle at 20% 50%, rgba(0,212,184,0.7), transparent 18%),
+        radial-gradient(circle at 55% 46%, rgba(29,161,255,0.92), transparent 16%),
+        radial-gradient(circle at 82% 50%, rgba(168,85,247,0.96), transparent 18%);
+      filter: blur(18px);
+      opacity: 0.95;
+      pointer-events: none;
+    }
+    .page-title {
+      margin: 0;
+      font-size: clamp(32px, 3vw, 40px);
+      letter-spacing: -0.04em;
+    }
+    .page-copy,
+    .section-copy,
+    .stat-meta {
+      margin: 8px 0 0;
+      color: var(--text-muted);
+      line-height: 1.5;
+      font-size: 13px;
+    }
+    .page-header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      gap: 18px;
+      flex-wrap: wrap;
+    }
+    .page-header-actions,
+    .page-filter-pills {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .page-hero-tools {
+      display: grid;
+      gap: 14px;
+      margin-top: 18px;
+    }
+    .page-action-btn,
+    .page-filter-pill {
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: rgba(17, 29, 48, 0.72);
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 700;
+      font-family: inherit;
+    }
+    button.page-action-btn,
+    button.page-filter-pill {
+      cursor: pointer;
+    }
+    .page-action-btn.is-active,
+    .page-filter-pill.is-active {
+      color: var(--text-strong);
+      border-color: rgba(29,161,255,0.3);
+      background: rgba(29,161,255,0.14);
+    }
+    .downloads-page-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+    }
+    .downloads-main-column {
+      display: grid;
+      gap: 12px;
+    }
+    .downloads-main {
+      display: grid;
+      gap: 12px;
+    }
+    .library-layout {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+      align-items: start;
+    }
+    .library-main,
+    .library-side,
+    .library-sections {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 16px;
+      min-width: 0;
+    }
+    .library-content-stage,
+    .downloads-main-column,
+    .downloads-main,
+    .library-browser-stage {
+      min-width: 0;
+    }
+    .downloads-filter-bar {
+      padding: 14px 16px 0;
+      display: grid;
+      gap: 12px;
+    }
+    .downloads-filter-group {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .downloads-filter-label {
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      min-width: 46px;
+    }
+    .downloads-filter-pill {
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 999px;
+      padding: 8px 12px;
+      background: rgba(255,255,255,0.04);
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .downloads-filter-pill.is-active {
+      color: var(--text-strong);
+      border-color: rgba(29,161,255,0.32);
+      background: rgba(29,161,255,0.14);
+    }
+    .library-browser-stage {
+      display: none;
+      gap: 16px;
+    }
+    .library-layout.is-download-view .library-browser-stage {
+      display: grid;
+      grid-template-columns: minmax(0, 1.85fr) minmax(320px, 0.7fr);
+      align-items: start;
+    }
+    .auto-download-panel {
+      grid-column: 1 / -1;
+    }
+    .library-layout.is-download-view .library-content-stage {
+      display: none;
+    }
+    .library-highlight-panel {
+      overflow: hidden;
+    }
+    .library-highlight {
+      height: 332px;
+      padding: 26px;
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) auto;
+      gap: 12px;
+      background:
+        linear-gradient(180deg, rgba(7, 16, 26, 0.08), rgba(7, 16, 26, 0.92)),
+        radial-gradient(circle at 72% 22%, rgba(132, 76, 255, 0.38), transparent 18%),
+        radial-gradient(circle at 52% 20%, rgba(14, 160, 255, 0.22), transparent 16%),
+        radial-gradient(circle at 35% 16%, rgba(22, 198, 171, 0.2), transparent 15%),
+        linear-gradient(135deg, #0f2034, #0b1625);
+      background-size: cover;
+      background-position: center;
+    }
+    .library-highlight-stage {
+      align-self: end;
+      display: grid;
+      gap: 12px;
+      align-content: end;
+      cursor: pointer;
+    }
+    .library-highlight-copy-group {
+      display: grid;
+      gap: 12px;
+      align-content: end;
+    }
+    .library-highlight-stage.is-animating {
+      animation: libraryHighlightSlide 320ms ease;
+    }
+    @keyframes libraryHighlightSlide {
+      from {
+        opacity: 0.25;
+        transform: translateX(18px);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+    .library-highlight-title {
+      margin: 0;
+      font-size: clamp(34px, 4vw, 48px);
+      line-height: 1.02;
+      letter-spacing: 0;
+      max-width: min(760px, 68vw);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .library-highlight-copy {
+      margin: 0;
+      color: rgba(232, 238, 247, 0.82);
+      line-height: 1.55;
+      font-size: 14px;
+      max-width: 74ch;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .library-highlight-controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: center;
+      margin-top: 6px;
+    }
+    .library-highlight-dots {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: center;
+      flex: 1 1 auto;
+    }
+    .library-highlight-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.3);
+      transition: transform 160ms ease, background 160ms ease;
+    }
+    .library-highlight-dot.is-active {
+      background: #ffffff;
+      transform: scale(1.2);
+    }
+    .library-highlight-arrow {
+      width: auto;
+      height: auto;
+      border: 0;
+      background: transparent;
+      color: var(--text-strong);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 22px;
+      line-height: 1;
+      padding: 0 2px;
+    }
+    .library-highlight-meta {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .library-highlight-meta .pill {
+      background: rgba(7, 16, 26, 0.58);
+    }
+    .library-section {
+      border-radius: 24px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(13, 24, 37, 0.92);
+      overflow: hidden;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.22);
+    }
+    .media-search-form {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+    }
+    .media-search-input {
+      min-width: 0;
+    }
+    .media-rail {
+      padding: 20px 20px 24px;
+      display: grid;
+      grid-auto-flow: column;
+      grid-auto-columns: minmax(200px, 1fr);
+      gap: 18px;
+      overflow-x: auto;
+      scrollbar-width: auto;
+      position: relative;
+    }
+    .media-rail::-webkit-scrollbar {
+      height: 10px;
+    }
+    .media-rail::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,0.14);
+      border-radius: 999px;
+    }
+    .media-rail::-webkit-scrollbar-track {
+      background: rgba(255,255,255,0.05);
+      border-radius: 999px;
+    }
+    .media-grid {
+      padding: 18px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 14px;
+    }
+    .media-card {
+      border-radius: 20px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.03);
+      display: grid;
+      gap: 0;
+      min-width: 0;
+      transition: transform 180ms ease, border-color 180ms ease, background 180ms ease;
+    }
+    .media-card:hover {
+      transform: translateY(-2px);
+      border-color: rgba(255,255,255,0.16);
+      background: rgba(255,255,255,0.045);
+    }
+    .media-card-poster {
+      position: relative;
+      aspect-ratio: 0.68;
+      background: linear-gradient(180deg, rgba(23, 40, 62, 0.92), rgba(11, 20, 31, 0.98));
+      overflow: hidden;
+    }
+    .media-card-poster img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .media-card-poster::after {
+      content: "";
+      position: absolute;
+      inset: auto 0 0;
+      height: 44%;
+      background: linear-gradient(180deg, rgba(8, 14, 24, 0), rgba(8, 14, 24, 0.9));
+    }
+    .media-card-badge {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 1;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(6, 14, 24, 0.72);
+      border: 1px solid rgba(255,255,255,0.08);
+      color: #dce8f8;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .media-card-body {
+      padding: 14px;
+      display: grid;
+      gap: 6px;
+    }
+    .media-card-title {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 700;
+      line-height: 1.35;
+    }
+    .media-card-meta {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .media-card-actions {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      z-index: 2;
+      display: flex;
+      gap: 8px;
+    }
+    .media-card-icon-btn {
+      width: 40px;
+      height: 40px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.06);
+      color: var(--text-strong);
+      display: inline-grid;
+      place-items: center;
+      cursor: pointer;
+      font-family: inherit;
+      box-shadow: 0 10px 22px rgba(0,0,0,0.24);
+    }
+    .media-card-icon-btn svg {
+      width: 20px;
+      height: 20px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.9;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .media-card-icon-btn.is-owned {
+      color: #9bf2bb;
+      border-color: rgba(34,197,94,0.24);
+      background: rgba(34,197,94,0.12);
+    }
+    .media-card-btn,
+    .media-card-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.06);
+      color: var(--text-strong);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 0 12px;
+      text-decoration: none;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .media-card-btn.primary {
+      background: rgba(15,123,255,0.18);
+      border-color: rgba(15,123,255,0.28);
+      color: #dfeeff;
+    }
+    .media-card-empty {
+      padding: 22px 18px;
+      color: var(--text-muted);
+    }
+    .auto-request-list {
+      display: grid;
+      gap: 8px;
+      padding: 16px;
+      max-height: min(360px, 42vh);
+      overflow: auto;
+      align-content: start;
+    }
+    .auto-request-item {
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 10px;
+      background: rgba(255,255,255,0.03);
+      overflow: hidden;
+    }
+    .auto-request-top {
+      display: grid;
+      grid-template-columns: 158px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 12px;
+      cursor: pointer;
+      list-style: none;
+    }
+    .auto-request-top::-webkit-details-marker {
+      display: none;
+    }
+    .auto-request-time {
+      color: var(--text-muted);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .auto-request-title {
+      min-width: 0;
+      color: var(--text-strong);
+      font-size: 13px;
+      font-weight: 800;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .auto-request-log {
+      margin: 0;
+      max-height: 160px;
+      overflow: auto;
+      border-top: 1px solid rgba(255,255,255,0.05);
+      background: rgba(0,0,0,0.24);
+      color: #c4d4e6;
+      padding: 10px 12px;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 11px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .auto-download-toasts {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      z-index: 90;
+      display: grid;
+      gap: 10px;
+      width: min(360px, calc(100vw - 36px));
+      pointer-events: none;
+    }
+    .auto-download-toast {
+      position: relative;
+      overflow: hidden;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(12, 22, 36, 0.96);
+      box-shadow: 0 22px 60px rgba(0,0,0,0.38);
+      padding: 14px 42px 14px 14px;
+      display: grid;
+      gap: 6px;
+      pointer-events: auto;
+    }
+    .auto-download-progress {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 3px;
+      background: linear-gradient(90deg, #16c6ab, #1da1ff);
+      transform-origin: left center;
+      animation-name: autoDownloadToastProgress;
+      animation-timing-function: linear;
+      animation-fill-mode: forwards;
+    }
+    @keyframes autoDownloadToastProgress {
+      from { transform: scaleX(1); }
+      to { transform: scaleX(0); }
+    }
+    .auto-download-close {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      width: 26px;
+      height: 26px;
+      border: 0;
+      border-radius: 9px;
+      background: rgba(255,255,255,0.06);
+      color: var(--text-muted);
+      cursor: pointer;
+      font: inherit;
+      line-height: 1;
+    }
+    .auto-download-close:hover {
+      color: var(--text-strong);
+      background: rgba(255,255,255,0.1);
+    }
+    .auto-download-title {
+      color: var(--text-strong);
+      font-size: 14px;
+      font-weight: 800;
+      line-height: 1.25;
+    }
+    .auto-download-copy {
+      color: var(--text-muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .media-modal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 28px;
+      background: rgba(4, 8, 14, 0.72);
+      backdrop-filter: blur(12px);
+      z-index: 60;
+    }
+    .media-modal.is-open {
+      display: flex;
+    }
+    .media-modal-card {
+      width: min(980px, 100%);
+      max-height: min(88vh, 920px);
+      overflow: auto;
+      border-radius: 28px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: linear-gradient(180deg, rgba(12, 22, 36, 0.98), rgba(9, 17, 28, 0.98));
+      box-shadow: 0 40px 120px rgba(0, 0, 0, 0.42);
+    }
+    .media-modal-hero {
+      min-height: 280px;
+      padding: 26px;
+      display: grid;
+      align-content: end;
+      gap: 12px;
+      background:
+        linear-gradient(180deg, rgba(7,16,26,0.1), rgba(7,16,26,0.96)),
+        linear-gradient(135deg, #0f2034, #0b1625);
+      background-size: cover;
+      background-position: center;
+    }
+    .media-modal-body {
+      padding: 24px 26px 26px;
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      gap: 22px;
+      align-items: start;
+    }
+    .media-modal-poster {
+      width: 100%;
+      aspect-ratio: 0.72;
+      border-radius: 22px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.04);
+    }
+    .media-modal-poster img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .media-modal-copy {
+      display: grid;
+      gap: 14px;
+    }
+    .media-modal-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: nowrap;
+      width: 100%;
+    }
+    .media-modal-meta .library-highlight-meta {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .media-modal-title {
+      margin: 0;
+      font-size: clamp(28px, 4vw, 42px);
+      line-height: 1.02;
+      letter-spacing: -0.05em;
+    }
+    .media-modal-overview {
+      margin: 0;
+      color: var(--text-muted);
+      line-height: 1.65;
+      font-size: 14px;
+    }
+    .media-modal-actions {
+      width: auto;
+      flex: 0 0 auto;
+    }
+    .media-modal-action-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.06);
+      color: var(--text-strong);
+      display: inline-grid;
+      place-items: center;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .media-modal-action-icon svg {
+      width: 20px;
+      height: 20px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.9;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .media-modal-action-icon.is-owned {
+      color: #9bf2bb;
+      border-color: rgba(34,197,94,0.24);
+      background: rgba(34,197,94,0.12);
+    }
+    .media-modal-action-icon.is-owned .jellyfin-dashboard-icon {
+      width: 22px;
+      height: 22px;
+      stroke: none;
+      fill: initial;
+    }
+    .media-detail-list {
+      display: grid;
+      gap: 10px;
+      width: 100%;
+    }
+    .media-detail-season {
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 16px;
+      background: rgba(255,255,255,0.03);
+    }
+    .media-detail-season {
+      padding: 10px 14px;
+      display: grid;
+      gap: 0;
+      width: 100%;
+    }
+    .media-detail-season[open] {
+      gap: 8px;
+    }
+    .media-detail-season summary {
+      list-style: none;
+      cursor: pointer;
+    }
+    .media-detail-season summary::-webkit-details-marker {
+      display: none;
+    }
+    .media-detail-arrow {
+      width: 16px;
+      height: 16px;
+      color: var(--text-strong);
+      flex: 0 0 auto;
+    }
+    .media-detail-arrow path {
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2.25;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .media-detail-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .media-detail-row-main {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .media-detail-row-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      flex: 0 0 auto;
+    }
+    .media-detail-count {
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .media-detail-title {
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .media-detail-episodes {
+      display: grid;
+      gap: 0;
+      width: 100%;
+    }
+    .media-detail-episode-row {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 0;
+      border-top: 1px solid rgba(255,255,255,0.06);
+    }
+    .media-detail-episode-title {
+      color: var(--text-strong);
+      font-size: 12px;
+    }
+    .media-detail-date {
+      color: var(--text-muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .media-detail-empty {
+      color: var(--text-muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .media-modal-close {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      width: 40px;
+      height: 40px;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(6,14,24,0.72);
+      color: var(--text-strong);
+      display: inline-grid;
+      place-items: center;
+      font-size: 18px;
+      cursor: pointer;
+    }
+    .downloads-tab-only,
+    .library-search-only {
+      display: none;
+    }
+    .premium-panel {
+      border-radius: 16px;
+      overflow: hidden;
+    }
+    .premium-header {
+      align-items: center;
+      border-bottom-color: rgba(255,255,255,0.06);
+    }
+    .premium-header > div:first-child {
+      display: grid;
+      align-content: center;
+      gap: 2px;
+    }
+    .section-title {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.15;
+      letter-spacing: -0.03em;
+      text-transform: none;
+    }
+    .download-card-grid {
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+    .download-card-grid {
+      grid-template-columns: 1fr;
+    }
+    .download-media-card,
+    .activity-item {
+      border-radius: 20px;
+      border: 1px solid rgba(255,255,255,0.07);
+      background: rgba(255,255,255,0.03);
+      transition: transform 180ms ease, border-color 180ms ease, background 180ms ease;
+    }
+    .download-media-card:hover,
+    .activity-item:hover {
+      transform: translateY(-2px);
+      border-color: rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.045);
+    }
+    .download-media-card {
+      padding: 0;
+      display: grid;
+      grid-template-columns: 168px minmax(0, 1fr);
+      gap: 0;
+      overflow: hidden;
+      min-height: 180px;
+      align-items: start;
+      contain: layout paint;
+    }
+    .active-card-poster {
+      width: 168px;
+      height: 208px;
+      min-height: 0;
+      padding: 0;
+      border-right: 1px solid rgba(255,255,255,0.06);
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+      display: flex;
+      align-items: stretch;
+      justify-content: stretch;
+      align-self: start;
+      overflow: hidden;
+    }
+    .active-card-main {
+      padding: 16px 18px;
+      display: grid;
+      gap: 14px;
+      min-width: 0;
+      align-content: start;
+    }
+    .active-card-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: start;
+    }
+    .active-card-body {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+    }
+    .active-card-progress-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+    }
+    .active-card-progress-tools {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      justify-self: end;
+    }
+    .active-card-progress-tools strong {
+      min-width: 36px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .active-card-metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(92px, 1fr));
+      gap: 18px;
+      align-items: center;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .active-card-metrics span {
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .media-cover,
+    .completed-cover {
+      border-radius: 18px;
+      background: linear-gradient(145deg, rgba(29,161,255,0.36), rgba(139,92,246,0.26));
+      border: 1px solid rgba(255,255,255,0.08);
+      display: grid;
+      place-items: end start;
+      padding: 10px;
+      overflow: hidden;
+      position: relative;
+    }
+    .media-cover {
+      width: 100%;
+      max-width: 104px;
+      height: 132px;
+    }
+    .active-card-poster .media-cover {
+      width: 100%;
+      max-width: none;
+      height: 100%;
+      min-height: 0;
+      border: 0;
+      border-radius: 0;
+    }
+    .completed-cover {
+      width: 100%;
+      aspect-ratio: 0.72;
+      margin-bottom: 14px;
+    }
+    .media-cover img,
+    .completed-cover img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      position: absolute;
+      inset: 0;
+    }
+    .completed-task-list {
+      padding: 18px;
+      display: grid;
+      gap: 12px;
+    }
+    .completed-list-item {
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,0.07);
+      background: rgba(255,255,255,0.03);
+    }
+    .completed-list-item summary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+      cursor: pointer;
+      list-style: none;
+    }
+    .completed-list-item summary::-webkit-details-marker {
+      display: none;
+    }
+    .completed-list-main {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .completed-list-top {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .completed-time-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(132px, 1fr));
+      gap: 8px 12px;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .completed-time-grid span {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .completed-log {
+      margin-top: 12px;
+      max-height: 300px;
+      overflow: auto;
+    }
+    .cover-badge {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      font-size: 10px;
+      font-weight: 700;
+      color: white;
+      padding: 5px 8px;
+      border-radius: 999px;
+      background: rgba(7,16,25,0.72);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .cover-title {
+      font-size: 20px;
+      font-weight: 800;
+      line-height: 1;
+      letter-spacing: -0.04em;
+      color: white;
+      text-shadow: 0 8px 24px rgba(0,0,0,0.42);
+    }
+    .media-meta {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+    .media-title {
+      font-size: 16px;
+      font-weight: 700;
+      line-height: 1.35;
+    }
+    .meta-row,
+    .meta-stack {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .type-chip,
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.08);
+      color: var(--text-strong);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .status-pill.running { color: #ffe7a0; }
+    .status-pill.paused { color: #d8c8ff; }
+    .status-pill.completed { color: #9bf2bb; }
+    .status-pill.failed { color: #ffb5ac; }
+    .progress-shell {
+      display: grid;
+      gap: 8px;
+    }
+    .progress {
+      height: 12px;
+      background: rgba(255,255,255,0.06);
+    }
+    .progress > span {
+      box-shadow: 0 0 20px rgba(29,161,255,0.3);
+      transition: width 180ms ease;
+    }
+    .card-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .task-stop-btn,
+    .task-pause-btn,
+    .secondary-btn {
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.05);
+      color: var(--text-strong);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .task-icon-btn {
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      border-radius: 999px;
+      display: inline-grid;
+      place-items: center;
+      font-size: 15px;
+      line-height: 1;
+    }
+    .task-stop-btn.task-icon-btn {
+      color: #ffcac4;
+    }
+    a.secondary-btn {
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+    }
+    .secondary-btn[disabled],
+    .task-stop-btn[disabled],
+    .task-pause-btn[disabled] {
+      opacity: 0.6;
+      cursor: default;
+    }
+    .task-log details {
+      border-top: 1px solid rgba(255,255,255,0.06);
+      padding-top: 12px;
+    }
+    .task-log summary {
+      cursor: pointer;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .log-box {
+      margin-top: 10px;
+    }
+    .task-log details[open] .log-box {
+      height: 360px;
+      max-height: 42vh;
+      overflow: auto;
+    }
+    .empty-premium {
+      padding: 38px 24px;
+      text-align: center;
+      display: grid;
+      gap: 10px;
+      justify-items: center;
+    }
+    .empty-illustration {
+      width: 72px;
+      height: 72px;
+      border-radius: 22px;
+      display: grid;
+      place-items: center;
+      font-size: 28px;
+      color: white;
+      background: linear-gradient(135deg, rgba(29,161,255,0.28), rgba(139,92,246,0.22));
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .empty-illustration svg {
+      width: 30px;
+      height: 30px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .add-download-content {
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+    .add-download-form {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+    }
+    .minor-copy {
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .network-panel {
+      padding: 18px;
+      display: grid;
+      gap: 16px;
+    }
+    .network-value {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.04em;
+    }
+    .network-chart {
+      position: relative;
+      height: 148px;
+      border-radius: 18px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.06);
+      background:
+        linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(10,18,31,0.94), rgba(9,17,28,0.78));
+      background-size: 100% 33%, 8.33% 100%, auto;
+    }
+    .network-chart svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .network-chart-line.primary {
+      stroke: #1d8cff;
+      filter: drop-shadow(0 0 10px rgba(29,140,255,0.32));
+    }
+    .network-chart-line.secondary {
+      stroke: #8b5cf6;
+      filter: drop-shadow(0 0 10px rgba(139,92,246,0.28));
+    }
+    .network-chart-fill {
+      fill: url(#networkAreaPrimary);
+      opacity: 0.32;
+    }
+    .network-legend {
+      display: flex;
+      gap: 18px;
+      flex-wrap: wrap;
+      align-items: center;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .network-legend-item {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .network-legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+    .network-legend-swatch.primary {
+      background: #1d8cff;
+      box-shadow: 0 0 10px rgba(29,140,255,0.4);
+    }
+    .network-legend-swatch.secondary {
+      background: #8b5cf6;
+      box-shadow: 0 0 10px rgba(139,92,246,0.4);
+    }
+    .browser-reconnect-btn {
+      min-width: 160px;
+    }
+    .settings-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    @media (max-width: 1280px) {
+      .downloads-page-layout,
+      .library-layout,
+      .downloads-layout {
+        grid-template-columns: 1fr;
+      }
+    }
+    @media (max-width: 1100px) {
+      .shell.shell-premium {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .sidebar {
+        position: fixed;
+        inset: 0 auto 0 0;
+        width: min(320px, calc(100vw - 24px));
+        transform: translateX(-110%);
+        transition: transform 180ms ease;
+        z-index: 35;
+        border-radius: 0;
+      }
+      body.sidebar-open .sidebar {
+        transform: translateX(0);
+      }
+      .mobile-nav-toggle {
+        display: inline-flex;
+      }
+      .app-main {
+        margin-left: 0;
+        padding-top: 60px;
+      }
+      .settings-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+    @media (max-width: 720px) {
+      .downloads-page-layout,
+      .library-layout,
+      .settings-grid,
+      .youtube-lookup-form,
+      .media-search-form {
+        grid-template-columns: 1fr;
+      }
+      .quick-actions,
+      .music-actions {
+        display: grid;
+      }
+      .download-media-card {
+        grid-template-columns: 1fr;
+      }
+      .active-card-metrics {
+        grid-template-columns: 1fr;
+        gap: 8px;
+      }
+      .completed-list-item summary,
+      .completed-time-grid {
+        grid-template-columns: 1fr;
+      }
+      .media-modal-body,
+      .library-layout.is-download-view .library-browser-stage {
+        grid-template-columns: 1fr;
+      }
+      .auto-request-top {
+        grid-template-columns: minmax(0, 1fr) auto;
+      }
+      .auto-request-time {
+        grid-column: 1 / -1;
+      }
+      .active-card-poster {
+        border: 0;
+        width: 100%;
+        height: 180px;
+      }
+      .media-card-header {
+        grid-template-columns: 64px minmax(0, 1fr);
+      }
+      .media-cover {
+        max-width: 64px;
+        height: 92px;
+      }
+      .active-card-poster .media-cover {
+        max-width: none;
+        height: 180px;
+      }
+    }
   </style>
 </head>
 <body>
-  <main class="shell">
-    <section class="header">
-      <div class="header-main">
-        <h1 class="title">Isambard</h1>
+  <button class="mobile-nav-toggle" id="mobile-nav-toggle" type="button" aria-expanded="false" aria-controls="sidebar-nav">Menu</button>
+  <main class="shell shell-premium">
+    <aside class="sidebar" id="sidebar-nav">
+      <div class="brand-block">
+        <div class="brand-mark">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M7 6h5M7 18h10"/></svg>
+        </div>
+        <div class="brand-meta">
+          <h1 class="brand-title">Isambard</h1>
+        </div>
       </div>
-      <nav class="tabs" aria-label="Primary">
-        <a class="tab-btn" href="/downloads" aria-selected="__DOWNLOADS_TAB_SELECTED__">Downloads</a>
-        <a class="tab-btn" href="/movies-tv" aria-selected="__MOVIES_TAB_SELECTED__">Movies &amp; TV</a>
-        <a class="tab-btn" href="/youtube" aria-selected="__YOUTUBE_TAB_SELECTED__">YouTube</a>
-        <a class="tab-btn" href="/music" aria-selected="__MUSIC_TAB_SELECTED__">Music</a>
-        <a class="tab-btn" href="/settings" aria-selected="__SETTINGS_TAB_SELECTED__">Settings</a>
-      </nav>
-    </section>
 
-    <section class="__DOWNLOADS_PAGE_CLASS__" data-page="downloads">
-      <section class="task-grid">
-        <details class="panel task-panel" open>
-          <summary class="task-panel-toggle">
-            <div class="panel-header">
-              <div class="panel-title-row">
-                <span class="panel-chevron" aria-hidden="true">&#x203a;</span>
-                <h2 class="panel-title">Active</h2>
-              </div>
-              <span class="pill" id="active-count">0 items</span>
-            </div>
-          </summary>
-          <div class="task-list-wrap">
-            <div class="task-list" id="active-task-list"></div>
-          </div>
-        </details>
-        <details class="panel task-panel" id="completed-panel">
-          <summary class="task-panel-toggle">
-            <div class="panel-header">
-              <div class="panel-title-row">
-                <span class="panel-chevron" aria-hidden="true">&#x203a;</span>
-                <h2 class="panel-title">Completed</h2>
-              </div>
-              <span class="pill" id="completed-count">0 items</span>
-            </div>
-          </summary>
-          <div class="task-list-wrap">
-            <div class="task-list" id="completed-task-list"></div>
-          </div>
-        </details>
-      </section>
-    </section>
+      <div class="nav-section">
+        <nav class="sidebar-nav" aria-label="Primary">
+          <a class="nav-item" href="/downloads" aria-selected="__DOWNLOADS_TAB_SELECTED__">
+            <span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 20h14"/></svg></span>
+            <span>Downloads</span>
+          </a>
+          <a class="nav-item" href="/movies-tv/discover" aria-selected="__MOVIES_TAB_SELECTED__">
+            <span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 3v4M17 3v4M3 10h18"/></svg></span>
+            <span>Movies &amp; TV</span>
+          </a>
+          <a class="nav-item" href="/youtube" aria-selected="__YOUTUBE_TAB_SELECTED__">
+            <span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 12s0-3-1-4.5c-.6-1-1.4-1.4-2.4-1.5C16.6 6 12 6 12 6s-4.6 0-6.6.1c-1 .1-1.8.5-2.4 1.5C2 9 2 12 2 12s0 3 1 4.5c.6 1 1.4 1.4 2.4 1.5 2 .1 6.6.1 6.6.1s4.6 0 6.6-.1c1-.1 1.8-.5 2.4-1.5 1-1.5 1-4.5 1-4.5Z"/><path d="M10 9l5 3-5 3V9Z"/></svg></span>
+            <span>YouTube</span>
+          </a>
+          <a class="nav-item" href="/music" aria-selected="__MUSIC_TAB_SELECTED__">
+            <span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V6l10-2v12"/><path d="M9 10l10-2"/><circle cx="6" cy="18" r="3"/><circle cx="19" cy="16" r="3"/></svg></span>
+            <span>Music</span>
+          </a>
+          <a class="nav-item" href="/settings" aria-selected="__SETTINGS_TAB_SELECTED__">
+            <span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5A3.5 3.5 0 1 1 8.5 12 3.5 3.5 0 0 1 12 8.5Z"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.2a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.2a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3h.1a1.6 1.6 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.2a1.6 1.6 0 0 0 1 1.5h.1a1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 0 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8v.1a1.6 1.6 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.2a1.6 1.6 0 0 0-1.5 1Z"/></svg></span>
+            <span>Settings</span>
+          </a>
+        </nav>
+      </div>
+      <div class="sidebar-footer">
+        <div class="sidebar-footer-bottom">
+          <button class="nav-item sidebar-collapse-btn" id="sidebar-collapse-btn" type="button" aria-pressed="false" title="Toggle sidebar">
+            <span class="nav-icon">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h4v14H4z"/><path d="M16 7l-4 5 4 5"/></svg>
+            </span>
+            <span>Collapse</span>
+          </button>
+        </div>
+      </div>
+    </aside>
 
-    <section class="__LIBRARY_PAGE_CLASS__" data-page="library">
-      <section class="top-grid">
-        <section class="browser-wrap">
-          <div class="panel browser-shell">
-          <div class="panel-header">
-            <div class="panel-title-row">
-                <select class="browser-site-select" id="browser-site-select" aria-label="Browser site">
-                  __BROWSER_SITE_OPTIONS__
-                </select>
+    <div class="app-main">
+      <div class="mullvad-banner" id="mullvad-banner">
+        <div>
+          <div class="mullvad-banner-title">Mullvad Disconnected</div>
+          <div class="mullvad-banner-copy">Connect Mullvad to enable browser navigation, stream detection, and outbound media lookups.</div>
+        </div>
+      </div>
+      <section class="__DOWNLOADS_PAGE_CLASS__" data-page="downloads">
+      <section class="downloads-page-layout">
+        <div class="downloads-main-column">
+          <section class="panel premium-panel downloads-tab-only">
+            <div class="downloads-search-panel">
+                <input id="downloads-page-search" class="search-input" type="search" placeholder="Search downloads…" aria-label="Search downloads">
             </div>
-            <div class="browser-controls" aria-label="Browser navigation">
-                <button class="browser-btn" data-browser-action="back" aria-label="Back" title="Back">&#x2039;</button>
-                <button class="browser-btn" data-browser-action="forward" aria-label="Forward" title="Forward">&#x203A;</button>
-                <button class="browser-btn" data-browser-action="reload" aria-label="Refresh" title="Refresh">&#x21bb;</button>
+            <div class="downloads-filter-bar">
+              <div class="downloads-filter-group" aria-label="Filter downloads by state">
+                <span class="downloads-filter-label">State</span>
+                <button class="downloads-filter-pill is-active" type="button" data-download-state-filter="all">All</button>
+                <button class="downloads-filter-pill" type="button" data-download-state-filter="running">Running</button>
+                <button class="downloads-filter-pill" type="button" data-download-state-filter="queued">Queued</button>
+                <button class="downloads-filter-pill" type="button" data-download-state-filter="paused">Paused</button>
+                <button class="downloads-filter-pill" type="button" data-download-state-filter="completed">Completed</button>
+                <button class="downloads-filter-pill" type="button" data-download-state-filter="failed">Failed</button>
+                <button class="downloads-filter-pill" type="button" data-download-state-filter="stopped">Stopped</button>
+              </div>
+              <div class="downloads-filter-group" aria-label="Filter downloads by type">
+                <span class="downloads-filter-label">Type</span>
+                <button class="downloads-filter-pill is-active" type="button" data-download-type-filter="all">All</button>
+                <button class="downloads-filter-pill" type="button" data-download-type-filter="movie">Movies</button>
+                <button class="downloads-filter-pill" type="button" data-download-type-filter="tv">TV</button>
+                <button class="downloads-filter-pill" type="button" data-download-type-filter="youtube">YouTube</button>
+                <button class="downloads-filter-pill" type="button" data-download-type-filter="music">Music</button>
+                <button class="downloads-filter-pill" type="button" data-download-type-filter="file">Files</button>
               </div>
             </div>
-            <div class="browser-body">
-              <iframe
-                id="browser-frame"
-                class="browser-frame"
-                src="__BROWSER_URL__"
-                tabindex="0"
-                allow="autoplay; clipboard-read; clipboard-write; fullscreen"
-                referrerpolicy="no-referrer"
-              ></iframe>
-            </div>
+          </section>
+          <div class="downloads-main">
+            <section class="panel premium-panel">
+              <header class="panel-header premium-header">
+                <div>
+                  <h3 class="section-title">Active Downloads</h3>
+                </div>
+                <div class="panel-toolbar">
+                  <span class="pill" id="active-count">0 items</span>
+                </div>
+              </header>
+              <div class="download-card-grid" id="active-task-list"></div>
+            </section>
+
+            <section class="panel premium-panel">
+              <header class="panel-header premium-header">
+                <div>
+                  <h3 class="section-title">Recently Completed</h3>
+                </div>
+                <div class="panel-toolbar">
+                  <span class="pill" id="completed-count">0 items</span>
+                </div>
+              </header>
+              <div class="completed-task-list" id="completed-task-list"></div>
+            </section>
           </div>
         </section>
+      </section>
 
-        <section class="panel stream-panel">
-          <header class="panel-header">
-            <h2 class="panel-title">Streams</h2>
+    <section class="__LIBRARY_PAGE_CLASS__" data-page="library">
+      <section class="page-hero">
+        <div class="page-header-row">
+          <div>
+            <p class="eyebrow">Movies &amp; TV</p>
+            <h2 class="page-title">Movies &amp; TV</h2>
+            <p class="page-copy">Discover new releases, browse your Jellyfin library, and drive YFlix from one place.</p>
+          </div>
+          <div class="page-header-actions">
+            <button class="page-action-btn is-active" type="button" data-media-view="discover">Discover</button>
+            <button class="page-action-btn" type="button" data-media-view="library">My Library</button>
+            <button class="page-action-btn" type="button" data-media-view="download">Download</button>
+          </div>
+        </div>
+        <div class="page-hero-tools library-search-only" id="media-search-tools">
+          <form class="media-search-form" id="media-search-form">
+            <input class="search-input media-search-input" id="media-search-input" type="search" placeholder="Search movies &amp; TV..." autocomplete="off">
+            <button class="youtube-btn primary" type="submit" id="media-search-submit">Search</button>
+          </form>
+        </div>
+      </section>
+      <section class="library-layout" id="library-layout">
+        <section class="library-content-stage">
+          <section class="library-main">
+            <section class="panel premium-panel library-highlight-panel">
+              <div class="library-highlight" id="library-highlight"></div>
+            </section>
+            <section class="library-sections" id="media-sections"></section>
+          </section>
+        </section>
+        <section class="library-browser-stage">
+          <section class="browser-wrap">
+            <div class="panel browser-shell">
+            <div class="panel-header">
+              <div class="panel-title-row">
+                  <select class="browser-site-select" id="browser-site-select" aria-label="Browser site">
+                    __BROWSER_SITE_OPTIONS__
+                  </select>
+              </div>
+              <div class="browser-controls" aria-label="Browser navigation">
+                  <button class="browser-btn" data-browser-action="back" aria-label="Back" title="Back">&#x2039;</button>
+                  <button class="browser-btn" data-browser-action="forward" aria-label="Forward" title="Forward">&#x203A;</button>
+                  <button class="browser-btn" data-browser-action="reload" aria-label="Refresh" title="Refresh">&#x21bb;</button>
+                </div>
+              </div>
+              <div class="browser-body">
+                <iframe
+                  id="browser-frame"
+                  class="browser-frame"
+                  src="__BROWSER_URL__"
+                  data-browser-src="__BROWSER_URL__"
+                  tabindex="0"
+                  allow="autoplay; clipboard-read; clipboard-write; fullscreen"
+                  referrerpolicy="no-referrer"
+                ></iframe>
+                <div class="browser-blocked" id="browser-blocked">
+                  <div class="browser-blocked-card">
+                    <div class="browser-blocked-icon">!</div>
+                    <div class="browser-blocked-title">Mullvad Required</div>
+                    <div class="browser-blocked-copy" id="browser-blocked-copy">Connect Mullvad to start the remote browser and reach internet destinations.</div>
+                    <button class="youtube-btn primary browser-reconnect-btn" type="button" id="browser-reconnect-btn">Reconnect Browser</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel stream-panel">
+            <header class="panel-header">
+              <h2 class="panel-title">Streams</h2>
             <span class="pill" id="browser-stream-count">0 detected</span>
           </header>
           <div class="stream-list" id="browser-stream-list"></div>
+          </section>
+          <section class="panel premium-panel auto-download-panel">
+            <header class="panel-header premium-header">
+              <div>
+                <h3 class="section-title">Auto Downloads</h3>
+              </div>
+            </header>
+            <div class="auto-request-list" id="auto-download-request-list"></div>
+          </section>
         </section>
       </section>
     </section>
 
     <section class="__YOUTUBE_PAGE_CLASS__" data-page="youtube">
+      <section class="page-hero">
+        <div class="page-header-row">
+          <div>
+            <p class="eyebrow">YouTube</p>
+            <h2 class="page-title">YouTube</h2>
+            <p class="page-copy">Search and download videos and playlists from YouTube.</p>
+          </div>
+        </div>
+        <div class="page-filter-pills">
+          <span class="page-filter-pill is-active">Search</span>
+          <span class="page-filter-pill">Subscriptions</span>
+          <span class="page-filter-pill">Playlists</span>
+          <span class="page-filter-pill">History</span>
+        </div>
+      </section>
       <section class="youtube-shell">
         <section class="panel">
           <header class="panel-header">
@@ -1546,6 +3582,27 @@ INDEX_HTML = """
     </section>
 
     <section class="__MUSIC_PAGE_CLASS__" data-page="music">
+      <section class="page-hero">
+        <div class="page-header-row">
+          <div>
+            <p class="eyebrow">Music</p>
+            <h2 class="page-title">Music</h2>
+            <p class="page-copy">Discover and download music and albums.</p>
+          </div>
+          <div class="page-header-actions">
+            <span class="page-action-btn is-active">Discover</span>
+            <span class="page-action-btn">Library</span>
+            <span class="page-action-btn">Playlists</span>
+          </div>
+        </div>
+        <div class="page-filter-pills">
+          <span class="page-filter-pill is-active">Popular</span>
+          <span class="page-filter-pill">New Releases</span>
+          <span class="page-filter-pill">Charts</span>
+          <span class="page-filter-pill">Genres</span>
+          <span class="page-filter-pill">Mood</span>
+        </div>
+      </section>
       <section class="music-shell">
         <section class="music-hero">
           <section class="panel music-hero-copy">
@@ -1699,6 +3756,21 @@ INDEX_HTML = """
     </section>
 
     <section class="__SETTINGS_PAGE_CLASS__" data-page="settings">
+      <section class="page-hero">
+        <div class="page-header-row">
+          <div>
+            <p class="eyebrow">Settings</p>
+            <h2 class="page-title">Settings</h2>
+            <p class="page-copy">Configure Isambard to your preferences.</p>
+          </div>
+        </div>
+        <div class="page-filter-pills">
+          <span class="page-filter-pill is-active">General</span>
+          <span class="page-filter-pill">Downloads</span>
+          <span class="page-filter-pill">Integrations</span>
+          <span class="page-filter-pill">Advanced</span>
+        </div>
+      </section>
       <section class="settings-grid">
         <section class="panel settings-card">
           <header class="panel-header">
@@ -1712,12 +3784,39 @@ INDEX_HTML = """
           </div>
           <div class="settings-summary" id="mullvad-status-summary"></div>
         </section>
-        <section class="panel settings-card empty-card">
+        <section class="panel settings-card">
           <header class="panel-header">
             <div class="panel-title-row">
-              <h2 class="panel-title">Downloads</h2>
+              <h2 class="panel-title">Storage</h2>
             </div>
           </header>
+          <div class="settings-storage">
+            <div class="settings-storage-top">
+              <div>
+                <div class="settings-storage-value" id="sidebar-storage-value">0%</div>
+                <div class="settings-summary" id="sidebar-storage-percent">0% used</div>
+              </div>
+              <div class="settings-summary" id="sidebar-storage-capacity">0 of 0</div>
+            </div>
+            <div class="storage-progress" aria-hidden="true"><span id="sidebar-storage-bar"></span></div>
+            <div class="settings-summary" id="sidebar-storage-detail">Downloads volume</div>
+          </div>
+        </section>
+        <section class="panel settings-card">
+          <header class="panel-header">
+            <div class="panel-title-row">
+              <h2 class="panel-title">Network</h2>
+            </div>
+          </header>
+          <div class="network-panel">
+            <div class="network-value" id="network-value">0 Mbps</div>
+            <div class="network-chart" id="network-sparkline"></div>
+            <div class="network-legend">
+              <span class="network-legend-item"><span class="network-legend-swatch primary"></span><span id="network-upload-label">0 Mbps Upload</span></span>
+              <span class="network-legend-item"><span class="network-legend-swatch secondary"></span><span id="network-download-label">0 Mbps Download</span></span>
+            </div>
+            <div class="minor-copy" id="network-pill">0 Mbps</div>
+          </div>
         </section>
         <section class="panel settings-card empty-card">
           <header class="panel-header">
@@ -1725,6 +3824,8 @@ INDEX_HTML = """
               <h2 class="panel-title">Movies &amp; TV</h2>
             </div>
           </header>
+          <div class="settings-summary" id="jellyfin-settings-summary">Jellyfin integration not configured.</div>
+          <div class="settings-summary" id="tmdb-settings-summary">TMDb integration not configured.</div>
         </section>
         <section class="panel settings-card empty-card">
           <header class="panel-header">
@@ -1742,7 +3843,27 @@ INDEX_HTML = """
         </section>
       </section>
     </section>
+    </div>
   </main>
+
+  <div class="media-modal" id="media-modal" aria-hidden="true">
+    <div class="media-modal-card">
+      <div class="media-modal-hero" id="media-modal-hero">
+        <button class="media-modal-close" type="button" id="media-modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="media-modal-body">
+        <div class="media-modal-poster" id="media-modal-poster"></div>
+        <div class="media-modal-copy">
+          <div class="media-modal-meta" id="media-modal-meta"></div>
+          <h3 class="media-modal-title" id="media-modal-title">Title</h3>
+          <p class="media-modal-overview" id="media-modal-overview"></p>
+          <div class="media-modal-actions" id="media-modal-actions"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="auto-download-toasts" id="auto-download-toasts" aria-live="polite" aria-atomic="false"></div>
 
   <script>
     const browserFrame = document.getElementById("browser-frame");
@@ -1755,6 +3876,33 @@ INDEX_HTML = """
     let pendingBrowserSite = "";
     let lastBrowserPageUrl = "";
     let lastBrowserSite = "";
+    const AUTO_DOWNLOAD_REQUESTS_KEY = "isambard.autoDownloadRequests";
+    const AUTO_DOWNLOAD_TOASTS_KEY = "isambard.autoDownloadToasts";
+    const AUTO_DOWNLOAD_TOAST_DURATION = 5000;
+
+    function localBrowserEmbedUrl(value) {
+      try {
+        const url = new URL(value, window.location.href);
+        const isLocalhost = url.hostname === "localhost" || url.hostname === "127.0.0.1";
+        const currentIsLocalhost = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+        if (isLocalhost && !currentIsLocalhost) {
+          url.hostname = window.location.hostname;
+          url.protocol = window.location.protocol;
+        }
+        return url.toString();
+      } catch (_error) {
+        return value;
+      }
+    }
+
+    if (browserFrame) {
+      const browserSrc = localBrowserEmbedUrl(browserFrame.dataset.browserSrc || browserFrame.src || "");
+      browserFrame.dataset.browserSrc = browserSrc;
+      if (browserFrame.src !== browserSrc) {
+        browserFrame.src = browserSrc;
+      }
+    }
+
     function cancelBrowserRefocus() {
       if (browserFocusTimer) {
         clearTimeout(browserFocusTimer);
@@ -1912,17 +4060,19 @@ INDEX_HTML = """
       const backButton = document.querySelector('[data-browser-action="back"]');
       const forwardButton = document.querySelector('[data-browser-action="forward"]');
       const siteSelect = document.getElementById("browser-site-select");
+      const mullvadConnected = !!window.__systemSummary?.mullvad?.connected;
       const pageChanged = !!state.page_url && state.page_url !== lastBrowserPageUrl;
       const siteChanged = !!state.site && state.site !== lastBrowserSite;
       if (backButton) {
-        backButton.disabled = !state.can_go_back;
+        backButton.disabled = !mullvadConnected || !state.can_go_back;
       }
       if (forwardButton) {
-        forwardButton.disabled = !state.can_go_forward;
+        forwardButton.disabled = !mullvadConnected || !state.can_go_forward;
       }
       if (siteSelect) {
         const effectiveSite = pendingBrowserSite || state.site || "yflix";
         siteSelect.value = effectiveSite;
+        siteSelect.disabled = !mullvadConnected;
         if (pendingBrowserSite && state.site === pendingBrowserSite) {
           pendingBrowserSite = "";
           browserControlLock = false;
@@ -1989,20 +4139,250 @@ INDEX_HTML = """
       ];
     }
 
-    function orderedTaskGroups() {
-      const tasks = allTasks();
-      const active = [
-        ...tasks.filter((task) => task.status === "running"),
-        ...tasks.filter((task) => task.status === "queued")
-      ];
-      const completed = tasks
-        .filter((task) => task.status === "completed" || task.status === "failed")
-        .sort((a, b) => (parseTime(b.finished_at)?.getTime() || 0) - (parseTime(a.finished_at)?.getTime() || 0));
-      return { active, completed };
+    function taskSourceLabel(task) {
+      const source = taskSourceKey(task);
+      if (source === "tv") return "TV";
+      if (source === "movie") return "Movie";
+      if (source === "youtube") return "YouTube";
+      if (source === "music") return "Music";
+      return "File";
     }
 
-    function findTaskForStream(url) {
-      return allTasks().find((task) => task.url === url) || null;
+    function taskSourceKey(task) {
+      const source = String(task?.source_type || task?.media_type || "file").toLowerCase();
+      if (["tv", "show", "series"].includes(source)) return "tv";
+      if (["movie", "film"].includes(source)) return "movie";
+      if (source.includes("youtube")) return "youtube";
+      if (source.includes("music") || source.includes("audio")) return "music";
+      return "file";
+    }
+
+    function groupedTasks() {
+      const search = String(window.__downloadSearch || "").trim().toLowerCase();
+      const stateFilter = String(window.__downloadStateFilter || "all").toLowerCase();
+      const typeFilter = String(window.__downloadTypeFilter || "all").toLowerCase();
+      const matches = (task) => {
+        const matchesSearch = !search || [task.title, task.url, task.output_template, task.media_type, task.source_type]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(search));
+        const matchesState = stateFilter === "all" || String(task.status || "").toLowerCase() === stateFilter;
+        const matchesType = typeFilter === "all" || taskSourceKey(task) === typeFilter;
+        return matchesSearch && matchesState && matchesType;
+      };
+      const tasks = allTasks().filter(matches);
+      const active = tasks
+        .filter((task) => task.status === "running" || task.status === "queued" || task.status === "paused")
+        .sort((a, b) => {
+          const aPriority = a.status === "running" ? 0 : a.status === "queued" ? 1 : 2;
+          const bPriority = b.status === "running" ? 0 : b.status === "queued" ? 1 : 2;
+          if (aPriority !== bPriority) return aPriority - bPriority;
+          return (parseTime(b.started_at || b.created_at)?.getTime() || 0) - (parseTime(a.started_at || a.created_at)?.getTime() || 0);
+        });
+      const completed = tasks
+        .filter((task) => ["completed", "failed", "stopped"].includes(task.status))
+        .sort((a, b) => (parseTime(b.finished_at)?.getTime() || 0) - (parseTime(a.finished_at)?.getTime() || 0));
+      const activity = tasks
+        .filter((task) => ["queued", "running", "paused", "completed", "failed", "stopped"].includes(task.status))
+        .sort((a, b) => {
+          const aTime = parseTime(a.finished_at || a.started_at || a.created_at)?.getTime() || 0;
+          const bTime = parseTime(b.finished_at || b.started_at || b.created_at)?.getTime() || 0;
+          return bTime - aTime;
+        });
+      return { active, completed, activity };
+    }
+
+    function parseSpeedMbps(value) {
+      const text = String(value || "").trim();
+      const match = text.match(/([0-9]+(?:\\.[0-9]+)?)\\s*([KMGTP]?i?B)\\/s/i);
+      if (!match) return 0;
+      const amount = Number(match[1]);
+      const unit = match[2].toUpperCase();
+      const multipliers = {
+        B: 1,
+        KB: 1e3,
+        KIB: 1024,
+        MB: 1e6,
+        MIB: 1024 ** 2,
+        GB: 1e9,
+        GIB: 1024 ** 3,
+        TB: 1e12,
+        TIB: 1024 ** 4
+      };
+      const bytesPerSecond = amount * (multipliers[unit] || 1);
+      return (bytesPerSecond * 8) / 1e6;
+    }
+
+    function formatMbps(value) {
+      if (!Number.isFinite(value) || value <= 0) return "0 Mbps";
+      if (value >= 100) return `${Math.round(value)} Mbps`;
+      if (value >= 10) return `${value.toFixed(1)} Mbps`;
+      return `${value.toFixed(2)} Mbps`;
+    }
+
+    function formatBytes(bytes) {
+      const value = Number(bytes || 0);
+      if (!Number.isFinite(value) || value <= 0) return "0 B";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let unitIndex = 0;
+      let size = value;
+      while (size >= 1024 && unitIndex < units.length - 1) {
+        size /= 1024;
+        unitIndex += 1;
+      }
+      return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
+    }
+
+    function formatRelativeTime(value) {
+      const parsed = parseTime(value);
+      if (!parsed) return "Unknown time";
+      const diffMs = Date.now() - parsed.getTime();
+      const diffMinutes = Math.round(diffMs / 60000);
+      if (Math.abs(diffMinutes) < 1) return "Just now";
+      if (Math.abs(diffMinutes) < 60) return `${Math.abs(diffMinutes)}m ${diffMinutes >= 0 ? "ago" : "from now"}`;
+      const diffHours = Math.round(diffMinutes / 60);
+      if (Math.abs(diffHours) < 24) return `${Math.abs(diffHours)}h ${diffHours >= 0 ? "ago" : "from now"}`;
+      const diffDays = Math.round(diffHours / 24);
+      return `${Math.abs(diffDays)}d ${diffDays >= 0 ? "ago" : "from now"}`;
+    }
+
+    function formatDateTime(value) {
+      const parsed = parseTime(value);
+      if (!parsed) return "Unknown";
+      return new Intl.DateTimeFormat(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit"
+      }).format(parsed);
+    }
+
+    function formatDurationBetween(startValue, endValue) {
+      const start = parseTime(startValue);
+      const end = parseTime(endValue);
+      if (!start || !end) return "Unknown";
+      const totalSeconds = Math.max(0, Math.round((end.getTime() - start.getTime()) / 1000));
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+      if (hours) return `${hours}h ${minutes}m`;
+      if (minutes) return `${minutes}m ${seconds}s`;
+      return `${seconds}s`;
+    }
+
+    function normalizeArtworkKey(value) {
+      return cleanMediaTitle(value || "")
+        .toLowerCase()
+        .replace(/\\(\\s*(?:19|20)\\d{2}\\s*\\)/g, " ")
+        .replace(/\\b(?:19|20)\\d{2}\\b/g, " ")
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim();
+    }
+
+    function artworkKeysForTitle(value) {
+      const raw = cleanMediaTitle(value || "");
+      const keys = [
+        normalizeArtworkKey(raw),
+        normalizeArtworkKey(raw.replace(/\\(\\s*(?:19|20)\\d{2}\\s*\\)/g, "")),
+        normalizeArtworkKey(raw.replace(/\\b(?:19|20)\\d{2}\\b/g, "")),
+      ].filter(Boolean);
+      return Array.from(new Set(keys));
+    }
+
+    function artworkSearchTitle(value) {
+      return cleanMediaTitle(value || "")
+        .replace(/\\(\\s*(?:19|20)\\d{2}\\s*\\)/g, " ")
+        .replace(/\\b(?:19|20)\\d{2}\\b/g, " ")
+        .replace(/\\s+/g, " ")
+        .trim();
+    }
+
+    function rememberArtworkItem(item) {
+      if (!item?.poster_url) return false;
+      window.__mediaArtworkByTitle = window.__mediaArtworkByTitle || {};
+      let changed = false;
+      artworkKeysForTitle(item.title || "").forEach((key) => {
+        if (key && !window.__mediaArtworkByTitle[key]) {
+          window.__mediaArtworkByTitle[key] = item;
+          changed = true;
+        }
+      });
+      return changed;
+    }
+
+    function taskArtwork(task) {
+      if (task?.poster_url) {
+        return {
+          title: task.series_name || task.title || "Poster",
+          poster_url: task.poster_url,
+          backdrop_url: task.backdrop_url || "",
+        };
+      }
+      const map = window.__mediaArtworkByTitle || {};
+      const keys = [
+        ...artworkKeysForTitle(task?.title || ""),
+        ...artworkKeysForTitle(task?.series_name || ""),
+      ];
+      for (const key of keys) {
+        const match = map[key];
+        if (match?.poster_url) {
+          return match;
+        }
+      }
+      return null;
+    }
+
+    function hydrateTaskArtwork(tasks) {
+      window.__artworkLookupDone = window.__artworkLookupDone || {};
+      window.__artworkLookupInFlight = window.__artworkLookupInFlight || {};
+      (tasks || []).forEach((task) => {
+        if (taskArtwork(task)) return;
+        const query = artworkSearchTitle(task.series_name || task.title || "");
+        const key = normalizeArtworkKey(query);
+        if (!query || !key || window.__artworkLookupDone[key] || window.__artworkLookupInFlight[key]) return;
+        window.__artworkLookupInFlight[key] = true;
+        fetch(`/api/media/discover?query=${encodeURIComponent(query)}`)
+          .then((response) => response.ok ? response.json() : null)
+          .then((state) => {
+            const items = (state?.sections || []).flatMap((section) => section.items || []).concat(state?.items || []);
+            const changed = items.some((item) => rememberArtworkItem(item));
+            window.__artworkLookupDone[key] = true;
+            if (changed) renderTasks();
+          })
+          .catch(() => {
+            window.__artworkLookupDone[key] = true;
+          })
+          .finally(() => {
+            delete window.__artworkLookupInFlight[key];
+          });
+      });
+    }
+
+    function buildCover(task) {
+      const artwork = taskArtwork(task);
+      if (artwork?.poster_url) {
+        return `<img src="${escapeHtml(artwork.poster_url)}" alt="${escapeHtml(artwork.title || task.title || "Poster")}">`;
+      }
+      const label = taskSourceLabel(task);
+      const title = cleanMediaTitle(task.title || "Untitled") || "Untitled";
+      const initials = title
+        .split(/\\s+/)
+        .filter(Boolean)
+        .slice(0, 2)
+        .map((part) => part[0]?.toUpperCase() || "")
+        .join("") || label[0];
+      return `
+        <div class="cover-badge">${escapeHtml(label)}</div>
+        <div class="cover-title">${escapeHtml(initials)}</div>
+      `;
+    }
+
+    function progressMeta(task) {
+      const parts = [];
+      if (task.filesize) parts.push(task.filesize);
+      if (task.speed) parts.push(task.speed);
+      if (task.eta) parts.push(`ETA ${task.eta}`);
+      return parts.join(" • ") || "Waiting for metadata";
     }
 
     function queueButtonLabel(task) {
@@ -2015,6 +4395,37 @@ INDEX_HTML = """
 
     function queueButtonDisabled(task) {
       return !!task && task.status !== "failed";
+    }
+
+    function findTaskForStream(url) {
+      return allTasks().find((task) => task.url === url) || null;
+    }
+
+    function captureTaskUiState(scope) {
+      const state = {};
+      scope?.querySelectorAll(".download-media-card[data-task-id]").forEach((card) => {
+        const taskId = card.dataset.taskId;
+        if (!taskId) return;
+        const details = card.querySelector(".task-log details");
+        const logBox = card.querySelector(".log-box");
+        state[taskId] = {
+          logsOpen: !!details?.open,
+          logScrollTop: logBox?.scrollTop || 0,
+        };
+      });
+      return state;
+    }
+
+    function restoreTaskUiState(scope, state) {
+      scope?.querySelectorAll(".download-media-card[data-task-id]").forEach((card) => {
+        const taskId = card.dataset.taskId;
+        const saved = taskId ? state[taskId] : null;
+        if (!saved) return;
+        const details = card.querySelector(".task-log details");
+        const logBox = card.querySelector(".log-box");
+        if (details) details.open = !!saved.logsOpen;
+        if (logBox) logBox.scrollTop = saved.logScrollTop || 0;
+      });
     }
 
     async function persistBrowserState(state) {
@@ -2046,130 +4457,220 @@ INDEX_HTML = """
       `;
     }
 
-    function taskCard(task) {
+    function activeTaskCard(task, savedState = {}) {
       const progress = task.status === "completed" ? 100 : Math.max(0, Math.min(100, task.progress || 0));
-      const progressClass = escapeHtml(task.status);
-      const extra = [task.speed, task.eta ? `ETA ${task.eta}` : ""].filter(Boolean).join(" • ");
       const logs = task.output || task.error || "No logs yet.";
-      const timestamps = [];
-      if (task.status === "queued") {
-        timestamps.push(`Added ${formatTime(task.created_at)}`);
-      } else if (task.status === "running") {
-        timestamps.push(`Started ${formatTime(task.started_at || task.created_at)}`);
-      } else {
-        timestamps.push(`Started ${formatTime(task.started_at || task.created_at)}`);
-        if (task.finished_at) {
-          timestamps.push(`Finished ${formatTime(task.finished_at)}`);
-        }
-      }
+      const startedLabel = task.status === "queued"
+        ? `Queued ${formatRelativeTime(task.created_at)}`
+        : `Started ${formatRelativeTime(task.started_at || task.created_at)}`;
       const outputPath = String(task.output_template || "").replace(/%\\((ext)\\)s/g, "mp4");
-      const sourceLabel = taskSourceLabel(task);
-      const progressBar = task.status === "running" || task.status === "failed"
-        ? `<div class="progress ${progressClass}"><span style="width:${progress}%"></span></div>`
-        : "";
-      const stopAction = (task.status === "queued" || task.status === "running")
-        ? `<button class="task-stop-btn" data-stop-task-id="${escapeHtml(task.id)}">${task.status === "queued" ? "Remove" : "Stop"}</button>`
-        : "";
+      const pauseAction = task.status === "paused" ? "resume" : "pause";
+      const pauseLabel = task.status === "paused" ? "Resume" : "Pause";
+      const pauseIcon = task.status === "paused" ? "▶" : "Ⅱ";
       return `
-        <details class="task ${escapeHtml(task.status)}" data-task-id="${escapeHtml(task.id)}">
-          <summary>
-            <div class="task-head">
-              <div class="task-topline">
-                <div class="task-title-row">
-                  <span class="status-chip status-${escapeHtml(task.status)}" aria-label="${escapeHtml(task.status)}"><span class="status-icon"></span></span>
-                  <div class="task-kind">${escapeHtml(sourceLabel)}</div>
-                  <div class="task-title">${escapeHtml(task.title)}</div>
-                  ${outputPath ? `<div class="task-title-path">${escapeHtml(outputPath)}</div>` : ""}
-                  ${task.filesize ? `<div class="task-inline-size">${escapeHtml(task.filesize)}</div>` : ""}
+        <article class="download-media-card" data-task-id="${escapeHtml(task.id)}">
+          <div class="active-card-poster" data-role="poster">
+            <div class="media-cover">${buildCover(task)}</div>
+          </div>
+          <div class="active-card-main">
+            <div class="active-card-top">
+              <div class="active-card-body">
+                <div class="meta-row">
+                  <span class="type-chip" data-role="type">${escapeHtml(taskSourceLabel(task))}</span>
+                  <span class="status-pill ${escapeHtml(task.status)}" data-role="status">${escapeHtml(task.status)}</span>
                 </div>
-                <div class="task-meta">
-                  ${timestamps.map((label) => `<span class="stamp">${escapeHtml(label)}</span>`).join("")}
-                  ${stopAction ? `<span class="task-actions">${stopAction}</span>` : ""}
+                <div class="media-title" data-role="title">${escapeHtml(cleanMediaTitle(task.title || "Untitled"))}</div>
+                <div class="meta-stack">
+                  <span data-role="started">${escapeHtml(startedLabel)}</span>
+                  <span data-role="output-path">${escapeHtml(outputPath || "")}</span>
                 </div>
               </div>
-              <div>
-                ${extra ? `<div class="task-extra">${escapeHtml(extra)}</div>` : ""}
+              <div class="active-card-progress-tools">
+                <strong data-role="progress-label">${escapeHtml(String(Math.round(progress)))}%</strong>
+                <button class="task-pause-btn task-icon-btn" type="button" data-task-control="pause" data-task-id="${escapeHtml(task.id)}" data-task-action="${escapeHtml(pauseAction)}" data-role="pause" aria-label="${escapeHtml(pauseLabel)}" title="${escapeHtml(pauseLabel)}">${pauseIcon}</button>
+                <button class="task-stop-btn task-icon-btn" type="button" data-stop-task-id="${escapeHtml(task.id)}" data-role="stop" aria-label="${task.status === "queued" ? "Remove" : "Cancel"}" title="${task.status === "queued" ? "Remove" : "Cancel"}">×</button>
               </div>
             </div>
-            ${progressBar}
-          </summary>
-          <div class="task-body">
-            <div class="task-url">${escapeHtml(task.url)}</div>
-            <pre class="log-box" data-task-id="${escapeHtml(task.id)}">${escapeHtml(logs)}</pre>
+            <div class="progress-shell">
+              <div class="progress ${escapeHtml(task.status)}" data-role="progress"><span style="width:${progress}%"></span></div>
+            </div>
+            <div class="active-card-metrics">
+              <span data-role="speed">${escapeHtml(task.speed || "Pending speed")}</span>
+              <span data-role="filesize">${escapeHtml(task.filesize || "Waiting for size")}</span>
+              <span data-role="eta">${escapeHtml(task.eta ? `ETA ${task.eta}` : "ETA pending")}</span>
+            </div>
+            <div class="task-log">
+              <details${savedState.logsOpen ? " open" : ""}>
+                <summary>View logs</summary>
+                <pre class="log-box" data-role="logs">${escapeHtml(logs)}</pre>
+              </details>
+            </div>
           </div>
-        </details>
+        </article>
       `;
     }
 
-    function captureLogScrollState() {
+    function setTextIfChanged(node, value) {
+      if (node && node.textContent !== value) {
+        node.textContent = value;
+      }
+    }
+
+    function updateActiveTaskCard(card, task) {
+      const progress = task.status === "completed" ? 100 : Math.max(0, Math.min(100, task.progress || 0));
+      const logs = task.output || task.error || "No logs yet.";
+      const startedLabel = task.status === "queued"
+        ? `Queued ${formatRelativeTime(task.created_at)}`
+        : `Started ${formatRelativeTime(task.started_at || task.created_at)}`;
+      const outputPath = String(task.output_template || "").replace(/%\\((ext)\\)s/g, "mp4");
+      setTextIfChanged(card.querySelector('[data-role="type"]'), taskSourceLabel(task));
+      const status = card.querySelector('[data-role="status"]');
+      if (status) {
+        status.className = `status-pill ${task.status || ""}`;
+        setTextIfChanged(status, task.status || "");
+      }
+      setTextIfChanged(card.querySelector('[data-role="title"]'), cleanMediaTitle(task.title || "Untitled"));
+      setTextIfChanged(card.querySelector('[data-role="started"]'), startedLabel);
+      setTextIfChanged(card.querySelector('[data-role="output-path"]'), outputPath || "");
+      setTextIfChanged(card.querySelector('[data-role="progress-label"]'), `${Math.round(progress)}%`);
+      const progressEl = card.querySelector('[data-role="progress"]');
+      if (progressEl) {
+        progressEl.className = `progress ${task.status || ""}`;
+        const bar = progressEl.querySelector("span");
+        if (bar) bar.style.width = `${progress}%`;
+      }
+      setTextIfChanged(card.querySelector('[data-role="speed"]'), task.speed || "Pending speed");
+      setTextIfChanged(card.querySelector('[data-role="filesize"]'), task.filesize || "Waiting for size");
+      setTextIfChanged(card.querySelector('[data-role="eta"]'), task.eta ? `ETA ${task.eta}` : "ETA pending");
+      setTextIfChanged(card.querySelector('[data-role="logs"]'), logs);
+      const pauseButton = card.querySelector('[data-role="pause"]');
+      if (pauseButton) {
+        const pauseAction = task.status === "paused" ? "resume" : "pause";
+        const pauseLabel = task.status === "paused" ? "Resume" : "Pause";
+        pauseButton.dataset.taskAction = pauseAction;
+        pauseButton.title = pauseLabel;
+        pauseButton.setAttribute("aria-label", pauseLabel);
+        setTextIfChanged(pauseButton, task.status === "paused" ? "▶" : "Ⅱ");
+      }
+      const stopButton = card.querySelector('[data-role="stop"]');
+      if (stopButton) {
+        const stopLabel = task.status === "queued" ? "Remove" : "Cancel";
+        stopButton.title = stopLabel;
+        stopButton.setAttribute("aria-label", stopLabel);
+      }
+      const coverHtml = buildCover(task);
+      const poster = card.querySelector('[data-role="poster"] .media-cover');
+      if (poster && poster.innerHTML !== coverHtml) {
+        poster.innerHTML = coverHtml;
+      }
+    }
+
+    function renderActiveTasks(activeList, tasks, activeUiState) {
+      const existing = new Map(Array.from(activeList.querySelectorAll(".download-media-card[data-task-id]")).map((card) => [card.dataset.taskId, card]));
+      tasks.forEach((task) => {
+        let card = existing.get(task.id);
+        if (!card) {
+          const template = document.createElement("template");
+          template.innerHTML = activeTaskCard(task, activeUiState[task.id] || {}).trim();
+          card = template.content.firstElementChild;
+          activeList.appendChild(card);
+          bindTaskButtons(card);
+        } else {
+          updateActiveTaskCard(card, task);
+        }
+        existing.delete(task.id);
+      });
+      existing.forEach((card) => card.remove());
+      const orderedCards = tasks
+        .map((task) => activeList.querySelector(`.download-media-card[data-task-id="${CSS.escape(task.id)}"]`))
+        .filter(Boolean);
+      orderedCards.forEach((card, index) => {
+        const current = activeList.children[index] || null;
+        if (current !== card) {
+          activeList.insertBefore(card, current);
+        }
+      });
+    }
+
+    function captureCompletedUiState(scope) {
       const state = {};
-      document.querySelectorAll(".log-box[data-task-id]").forEach((node) => {
-        const maxScroll = Math.max(0, node.scrollHeight - node.clientHeight);
-        state[node.dataset.taskId] = {
-          top: node.scrollTop,
-          follow: maxScroll - node.scrollTop <= 8
+      scope?.querySelectorAll(".completed-list-item[data-task-id]").forEach((row) => {
+        const taskId = row.dataset.taskId;
+        if (!taskId) return;
+        state[taskId] = {
+          open: !!row.open,
+          logScrollTop: row.querySelector(".completed-log")?.scrollTop || 0
         };
       });
       return state;
     }
 
-    function restoreLogScrollState(state) {
-      document.querySelectorAll(".log-box[data-task-id]").forEach((node) => {
-        const saved = state[node.dataset.taskId];
-        if (!saved) {
-          return;
-        }
-        if (saved.follow) {
-          node.scrollTop = node.scrollHeight;
-          return;
-        }
-        const maxScroll = Math.max(0, node.scrollHeight - node.clientHeight);
-        node.scrollTop = Math.min(saved.top, maxScroll);
+    function restoreCompletedUiState(scope, state) {
+      scope?.querySelectorAll(".completed-list-item[data-task-id]").forEach((row) => {
+        const saved = state[row.dataset.taskId];
+        if (!saved) return;
+        row.open = !!saved.open;
+        const log = row.querySelector(".completed-log");
+        if (log) log.scrollTop = saved.logScrollTop || 0;
       });
     }
 
-    function renderTaskList(listId, tasks, emptyMessage, openTaskId) {
-      const list = document.getElementById(listId);
-      if (!tasks.length) {
-        const emptyClass = listId === "active-task-list" ? "empty empty-centered" : "empty";
-        list.innerHTML = `<div class="${emptyClass}">${escapeHtml(emptyMessage)}</div>`;
-        return;
-      }
-      list.innerHTML = tasks.map(taskCard).join("");
-      if (openTaskId) {
-        const openNode = list.querySelector(`.task[data-task-id="${CSS.escape(openTaskId)}"]`);
-        if (openNode) {
-          openNode.open = true;
-        }
-      }
-      list.querySelectorAll(".task[data-task-id]").forEach((node) => {
-        node.addEventListener("toggle", () => {
-          if (!node.open) {
-            if (window.__openTaskId === node.dataset.taskId) {
-              window.__openTaskId = "";
-            }
-            return;
+    function completedTaskCard(task) {
+      const finished = task.finished_at ? formatRelativeTime(task.finished_at) : "Unknown time";
+      const logs = task.output || task.error || "No logs available.";
+      const artwork = taskArtwork(task);
+      const jellyfinUrl = artwork?.jellyfin_url || (window.__systemSummary?.jellyfin?.configured ? window.__systemSummary.jellyfin.url : "");
+      const status = task.status || "completed";
+      const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
+      return `
+        <details class="completed-list-item" data-task-id="${escapeHtml(task.id)}">
+          <summary>
+            <div class="completed-list-main">
+              <div class="completed-list-top">
+                <span class="type-chip">${escapeHtml(taskSourceLabel(task))}</span>
+                <div class="media-title">${escapeHtml(cleanMediaTitle(task.title || "Untitled"))}</div>
+              </div>
+            </div>
+            <div class="card-actions">
+              <span class="meta-row">${escapeHtml(finished)}</span>
+              <span class="status-pill ${escapeHtml(status)}">${escapeHtml(statusLabel)}</span>
+              ${jellyfinUrl ? `<a class="secondary-btn" href="${escapeHtml(jellyfinUrl)}" target="_blank" rel="noreferrer">Open Jellyfin</a>` : ""}
+            </div>
+          </summary>
+          <div class="completed-time-grid">
+            <span>Queued ${escapeHtml(formatDateTime(task.created_at))}</span>
+            <span>Started ${escapeHtml(formatDateTime(task.started_at))}</span>
+            <span>Completed ${escapeHtml(formatDateTime(task.finished_at))}</span>
+            <span>Took ${escapeHtml(formatDurationBetween(task.started_at || task.created_at, task.finished_at))}</span>
+          </div>
+          <pre class="log-box completed-log">${escapeHtml(logs)}</pre>
+        </details>
+      `;
+    }
+
+    function bindTaskButtons(scope) {
+      scope.querySelectorAll(".task-pause-btn[data-task-id]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const taskId = button.dataset.taskId;
+          const action = button.dataset.taskAction === "resume" ? "resume" : "pause";
+          if (!taskId) return;
+          button.disabled = true;
+          try {
+            await fetch(`/api/tasks/${taskId}/${action}`, { method: "POST" });
+            await refresh();
+          } finally {
+            button.disabled = false;
           }
-          window.__openTaskId = node.dataset.taskId;
-          document.querySelectorAll(".task[data-task-id][open]").forEach((other) => {
-            if (other !== node) {
-              other.open = false;
-            }
-          });
         });
       });
-      list.querySelectorAll(".task-stop-btn[data-stop-task-id]").forEach((button) => {
-        button.addEventListener("click", async (event) => {
-          event.preventDefault();
-          event.stopPropagation();
+      scope.querySelectorAll(".task-stop-btn[data-stop-task-id]").forEach((button) => {
+        button.addEventListener("click", async () => {
           const taskId = button.dataset.stopTaskId;
-          if (!taskId) {
-            return;
-          }
+          if (!taskId) return;
           button.disabled = true;
           try {
             await fetch(`/api/tasks/${taskId}/stop`, { method: "POST" });
-            refresh();
+            await refresh();
           } finally {
             button.disabled = false;
           }
@@ -2177,23 +4678,902 @@ INDEX_HTML = """
       });
     }
 
-    function renderTasks() {
-      const groups = orderedTaskGroups();
-      const openTaskId = window.__openTaskId || "";
-      const logScrollState = captureLogScrollState();
-      document.getElementById("active-count").textContent = `${groups.active.length} items`;
-      document.getElementById("completed-count").textContent = `${groups.completed.length} items`;
-      renderTaskList("active-task-list", groups.active, "No active tasks.", openTaskId);
-      renderTaskList("completed-task-list", groups.completed, "No completed tasks yet.", openTaskId);
-      restoreLogScrollState(logScrollState);
+    function renderStats(groups) {
+      const activeCount = groups.active.length;
+      const throughput = groups.active.reduce((sum, task) => sum + parseSpeedMbps(task.speed), 0);
+      document.getElementById("network-value").textContent = formatMbps(throughput);
+      document.getElementById("network-pill").textContent = formatMbps(throughput);
+
+      window.__networkHistory = [...(window.__networkHistory || []), throughput].slice(-24);
+      window.__uploadHistory = [...(window.__uploadHistory || []), Math.max(0, throughput * 0.18 + (activeCount ? 2 : 0))].slice(-24);
     }
 
-    function taskSourceLabel(task) {
-      const source = String(task.source_type || task.media_type || "standard").toLowerCase();
-      if (source === "tv") return "TV";
-      if (source === "movie") return "Movie";
-      if (source === "youtube") return "YouTube";
-      return source || "Standard";
+    function renderNetworkSparkline() {
+      const downloadValues = window.__networkHistory || [];
+      const uploadValues = window.__uploadHistory || [];
+      const container = document.getElementById("network-sparkline");
+      if (!container) return;
+      if (!downloadValues.length) {
+        container.innerHTML = `<div class="minor-copy">No network samples yet.</div>`;
+        return;
+      }
+      const width = 320;
+      const height = 148;
+      const max = Math.max(...downloadValues, ...uploadValues, 1);
+      const toPoints = (values, graphHeight, invertOffset = 0) => values.map((value, index) => {
+        const x = (index / Math.max(values.length - 1, 1)) * width;
+        const y = height - invertOffset - ((value / max) * graphHeight + 12);
+        return `${x.toFixed(2)},${Math.max(10, Math.min(height - 10, y)).toFixed(2)}`;
+      }).join(" ");
+      const primaryPoints = toPoints(downloadValues, 96);
+      const secondaryPoints = toPoints(uploadValues, 72, 8);
+      const areaPoints = `0,${height} ${primaryPoints} ${width},${height}`;
+      container.innerHTML = `
+        <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <linearGradient id="networkAreaPrimary" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="rgba(29,140,255,0.48)"></stop>
+              <stop offset="100%" stop-color="rgba(29,140,255,0)"></stop>
+            </linearGradient>
+          </defs>
+          <polygon class="network-chart-fill" points="${areaPoints}"></polygon>
+          <polyline class="network-chart-line primary" points="${primaryPoints}" fill="none" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></polyline>
+          <polyline class="network-chart-line secondary" points="${secondaryPoints}" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></polyline>
+        </svg>
+      `;
+      const latestDownload = downloadValues[downloadValues.length - 1] || 0;
+      const latestUpload = uploadValues[uploadValues.length - 1] || 0;
+      const uploadLabel = document.getElementById("network-upload-label");
+      const downloadLabel = document.getElementById("network-download-label");
+      if (uploadLabel) uploadLabel.textContent = `${formatMbps(latestUpload)} Upload`;
+      if (downloadLabel) downloadLabel.textContent = `${formatMbps(latestDownload)} Download`;
+    }
+
+    function renderTasks() {
+      const groups = groupedTasks();
+      const activeList = document.getElementById("active-task-list");
+      const completedList = document.getElementById("completed-task-list");
+      const activeUiState = captureTaskUiState(activeList);
+      const completedUiState = captureCompletedUiState(completedList);
+      document.getElementById("active-count").textContent = `${groups.active.length} items`;
+      document.getElementById("completed-count").textContent = `${groups.completed.length} items`;
+
+      if (!groups.active.length) {
+        activeList.innerHTML = `
+          <div class="empty-premium">
+            <div class="empty-illustration">${downloadIconSvg()}</div>
+            <strong>No active downloads</strong>
+            <div class="minor-copy">Add a magnet link, torrent, URL, or start a browser capture.</div>
+          </div>
+        `;
+      } else {
+        const emptyState = activeList.querySelector(".empty-premium");
+        if (emptyState) activeList.innerHTML = "";
+        renderActiveTasks(activeList, groups.active, activeUiState);
+        restoreTaskUiState(activeList, activeUiState);
+        hydrateTaskArtwork(groups.active);
+      }
+
+      if (!groups.completed.length) {
+        completedList.innerHTML = `<div class="empty">No completed media yet.</div>`;
+      } else {
+        completedList.innerHTML = groups.completed.slice(0, 12).map(completedTaskCard).join("");
+        restoreCompletedUiState(completedList, completedUiState);
+      }
+
+      renderStats(groups);
+      renderNetworkSparkline();
+    }
+
+    function notifyTaskStatusChanges() {
+      const previous = window.__knownTaskStatuses;
+      const next = {};
+      allTasks().forEach((task) => {
+        if (!task?.id) return;
+        const status = String(task.status || "");
+        next[task.id] = status;
+        if (!previous) return;
+        const oldStatus = previous[task.id];
+        if (oldStatus && oldStatus !== status && status === "completed") {
+          showAutoDownloadToast("Download complete", cleanMediaTitle(task.title || "Download finished"));
+        }
+      });
+      window.__knownTaskStatuses = next;
+    }
+
+    function activePageName() {
+      return document.querySelector(".page.is-active")?.dataset.page || "downloads";
+    }
+
+    function currentMediaView() {
+      return window.__mediaView || "discover";
+    }
+
+    function updatePageVisibilityState() {
+      const page = activePageName();
+      document.querySelectorAll(".downloads-tab-only").forEach((node) => {
+        node.style.display = page === "downloads" ? "" : "none";
+      });
+    }
+
+    function setMediaArtworkMap() {
+      const artwork = {};
+      const libraryMatches = {};
+      const states = [window.__discoverState, window.__libraryState];
+      states.forEach((state) => {
+        const sections = state?.sections || [];
+        sections.forEach((section) => {
+          (section.items || []).forEach((item) => {
+            const key = normalizeArtworkKey(item.title || "");
+            const keys = artworkKeysForTitle(item.title || "");
+            keys.forEach((itemKey) => {
+              if (itemKey && item.poster_url && !artwork[itemKey]) {
+                artwork[itemKey] = item;
+              }
+            });
+            if (key && item.poster_url && !artwork[key]) {
+              artwork[key] = item;
+            }
+            if (state === window.__libraryState && key && !libraryMatches[key]) {
+              libraryMatches[key] = item;
+            }
+          });
+        });
+        (state?.items || []).forEach((item) => {
+          const key = normalizeArtworkKey(item.title || "");
+          const keys = artworkKeysForTitle(item.title || "");
+          keys.forEach((itemKey) => {
+            if (itemKey && item.poster_url && !artwork[itemKey]) {
+              artwork[itemKey] = item;
+            }
+          });
+          if (state === window.__libraryState && key && !libraryMatches[key]) {
+            libraryMatches[key] = item;
+          }
+        });
+      });
+      window.__mediaArtworkByTitle = artwork;
+      window.__libraryMediaByTitle = libraryMatches;
+    }
+
+    function mediaPathForView(view) {
+      if (view === "library") return "/movies-tv/library";
+      if (view === "download") return "/movies-tv/download";
+      return "/movies-tv/discover";
+    }
+
+    function mediaOwnedItem(item) {
+      const key = normalizeArtworkKey(item?.title || "");
+      return key ? (window.__libraryMediaByTitle || {})[key] || null : null;
+    }
+
+    function jellyfinFallbackUrl(title) {
+      const base = window.__systemSummary?.jellyfin?.url || "";
+      if (!base) return "";
+      const cleanBase = base.endsWith("/") ? base.slice(0, -1) : base;
+      return `${cleanBase}/web/`;
+    }
+
+    async function fetchLocalMediaStatuses(requests) {
+      const results = await Promise.all((requests || []).map(async (request) => {
+        try {
+          const response = await fetch("/api/media/local-status", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(request.payload)
+          });
+          const status = response.ok ? await response.json() : { exists: false };
+          return [request.key, status];
+        } catch (_error) {
+          return [request.key, { exists: false }];
+        }
+      }));
+      return Object.fromEntries(results);
+    }
+
+    function heroCarouselItems() {
+      const sections = window.__discoverState?.sections || [];
+      return sections
+        .filter((section) => section.id === "trending_movies" || section.id === "trending_tv" || section.id === "popular_movies")
+        .flatMap((section) => section.items || [])
+        .slice(0, 6);
+    }
+
+    function setHeroCarouselIndex(nextIndex) {
+      const items = heroCarouselItems();
+      if (!items.length) {
+        window.__heroCarouselIndex = 0;
+        return;
+      }
+      const total = items.length;
+      window.__heroCarouselIndex = ((nextIndex % total) + total) % total;
+      renderMediaHighlight();
+    }
+
+    function switchMediaView(name, options = {}) {
+      const { updateHistory = true, historyMode = "replace" } = options;
+      window.__mediaView = name === "library" ? "library" : name === "download" ? "download" : "discover";
+      document.querySelectorAll("[data-media-view]").forEach((button) => {
+        button.classList.toggle("is-active", button.dataset.mediaView === window.__mediaView);
+      });
+      const layout = document.getElementById("library-layout");
+      const searchTools = document.getElementById("media-search-tools");
+      if (layout) {
+        layout.classList.toggle("is-download-view", window.__mediaView === "download");
+      }
+      if (searchTools) {
+        searchTools.style.display = window.__mediaView === "download" ? "none" : "grid";
+      }
+      if (window.__mediaView === "download" && window.__systemSummary?.mullvad?.connected) {
+        renderBrowserAvailability(true);
+      }
+      if (updateHistory && window.location.pathname !== mediaPathForView(window.__mediaView)) {
+        const method = historyMode === "push" ? "pushState" : "replaceState";
+        history[method]({}, "", mediaPathForView(window.__mediaView));
+      }
+      renderAutoDownloadRequests();
+      renderMediaSections();
+    }
+
+    function renderMediaHighlight() {
+      const root = document.getElementById("library-highlight");
+      if (!root) return;
+      const state = currentMediaView() === "library" ? window.__libraryState : window.__discoverState;
+      const query = (state?.query || "").trim();
+      root.parentElement?.style.setProperty("display", query ? "none" : "");
+      const highlightItems = currentMediaView() === "discover" ? heroCarouselItems() : (state?.sections || []).flatMap((section) => section.items || []).slice(0, 6);
+      const item = highlightItems[Math.abs(window.__heroCarouselIndex || 0) % Math.max(highlightItems.length, 1)];
+      if (!item) {
+        root.innerHTML = `
+          <div class="library-highlight-label">Featured</div>
+          <h3 class="library-highlight-title">No media loaded</h3>
+          <p class="library-highlight-copy">Connect Mullvad and configure Jellyfin or TMDb to populate this page.</p>
+        `;
+        root.style.backgroundImage = "";
+        return;
+      }
+      const backdrop = item.backdrop_url ? `linear-gradient(180deg, rgba(7,16,26,0.08), rgba(7,16,26,0.92)), url("${item.backdrop_url}")` : "";
+      root.style.backgroundImage = backdrop || "";
+      root.style.backgroundSize = backdrop ? "cover" : "";
+      root.style.backgroundPosition = backdrop ? "center" : "";
+      const modalPayload = encodeURIComponent(JSON.stringify(item));
+      root.innerHTML = `
+        <div class="library-highlight-stage" id="library-highlight-stage" data-media-modal="${escapeHtml(modalPayload)}">
+          <div class="library-highlight-copy-group">
+            <h3 class="library-highlight-title">${escapeHtml(item.title || "Untitled")}</h3>
+            <p class="library-highlight-copy">${escapeHtml(item.overview || "Poster-backed media discovery and library handoff live here.")}</p>
+          </div>
+          <div class="library-highlight-meta">
+            ${item.year ? `<span class="pill">${escapeHtml(item.year)}</span>` : ""}
+            ${item.media_type ? `<span class="pill">${escapeHtml(item.media_type === "tv" ? "TV" : "Movie")}</span>` : ""}
+            ${item.rating ? `<span class="pill">★ ${escapeHtml(Number(item.rating || 0).toFixed(1))}</span>` : ""}
+          </div>
+        </div>
+        ${currentMediaView() === "discover" && highlightItems.length ? `
+          <div class="library-highlight-controls">
+            <button class="library-highlight-arrow" type="button" id="hero-prev-btn" aria-label="Previous">‹</button>
+            <div class="library-highlight-dots">
+              ${highlightItems.map((_, index) => `<span class="library-highlight-dot ${index === (window.__heroCarouselIndex || 0) ? "is-active" : ""}"></span>`).join("")}
+            </div>
+            <button class="library-highlight-arrow" type="button" id="hero-next-btn" aria-label="Next">›</button>
+          </div>
+        ` : ""}
+      `;
+      const stage = document.getElementById("library-highlight-stage");
+      if (stage) {
+        stage.classList.remove("is-animating");
+        void stage.offsetWidth;
+        stage.classList.add("is-animating");
+        stage.addEventListener("click", () => openMediaModal(item));
+      }
+      document.getElementById("hero-prev-btn")?.addEventListener("click", () => setHeroCarouselIndex((window.__heroCarouselIndex || 0) - 1));
+      document.getElementById("hero-next-btn")?.addEventListener("click", () => setHeroCarouselIndex((window.__heroCarouselIndex || 0) + 1));
+    }
+
+    function downloadIconSvg() {
+      return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11"/><path d="M8 11l4 4 4-4"/><path d="M5 19h14"/></svg>';
+    }
+
+    function checkIconSvg() {
+      return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>';
+    }
+
+    function jellyfinIconSvg() {
+      const suffix = Math.random().toString(36).slice(2);
+      const gradientA = `jellyfin-a-${suffix}`;
+      const gradientB = `jellyfin-b-${suffix}`;
+      return `<svg class="jellyfin-dashboard-icon" xmlns="http://www.w3.org/2000/svg" xml:space="preserve" viewBox="0 0 512 512" aria-hidden="true"><linearGradient id="${gradientA}" x1="97.508" x2="522.069" y1="308.135" y2="63.019" gradientTransform="matrix(1 0 0 -1 0 514)" gradientUnits="userSpaceOnUse"><stop offset="0" style="stop-color:#aa5cc3"/><stop offset="1" style="stop-color:#00a4dc"/></linearGradient><path d="M256 196.2c-22.4 0-94.8 131.3-83.8 153.4s156.8 21.9 167.7 0-61.3-153.4-83.9-153.4" style="fill:url(#${gradientA})"/><linearGradient id="${gradientB}" x1="94.193" x2="518.754" y1="302.394" y2="57.278" gradientTransform="matrix(1 0 0 -1 0 514)" gradientUnits="userSpaceOnUse"><stop offset="0" style="stop-color:#aa5cc3"/><stop offset="1" style="stop-color:#00a4dc"/></linearGradient><path d="M256 0C188.3 0-29.8 395.4 3.4 462.2s472.3 66 505.2 0S323.8 0 256 0m165.6 404.3c-21.6 43.2-309.3 43.8-331.1 0S211.7 101.4 256 101.4 443.2 361 421.6 404.3" style="fill:url(#${gradientB})"/></svg>`;
+    }
+
+    function mediaCard(item) {
+      const typeLabel = item.media_type === "tv" ? "TV Show" : "Movie";
+      const modalPayload = encodeURIComponent(JSON.stringify(item));
+      return `
+        <article class="media-card" data-media-modal="${escapeHtml(modalPayload)}">
+          <div class="media-card-poster">
+            ${item.poster_url ? `<img src="${escapeHtml(item.poster_url)}" alt="${escapeHtml(item.title || "Poster")}">` : ""}
+            <span class="media-card-badge">${escapeHtml(typeLabel)}</span>
+          </div>
+          <div class="media-card-body">
+            <h4 class="media-card-title">${escapeHtml(item.title || "Untitled")}</h4>
+            <div class="media-card-meta">
+              ${item.year ? `<span>${escapeHtml(item.year)}</span>` : ""}
+              ${item.rating ? `<span>★ ${escapeHtml(Number(item.rating || 0).toFixed(1))}</span>` : ""}
+            </div>
+          </div>
+        </article>
+      `;
+    }
+
+    function renderMediaModalActionButton(payload, owned, jellyfinUrl) {
+      if (owned && jellyfinUrl) {
+        return `<a class="media-modal-action-icon is-owned" href="${escapeHtml(jellyfinUrl)}" target="_blank" rel="noreferrer" title="Open in Jellyfin">${jellyfinIconSvg()}</a>`;
+      }
+      return `<button class="media-modal-action-icon" type="button" data-media-autofind="${escapeHtml(encodeURIComponent(JSON.stringify(payload)))}" title="Download">${downloadIconSvg()}</button>`;
+    }
+
+    function renderTvDetailActions(item, details, owned, localStatuses = {}) {
+      const seasons = details?.seasons || [];
+      if (!seasons.length) {
+        return '<div class="media-detail-empty">No season data available yet.</div>';
+      }
+      return `
+        <div class="media-detail-list">
+          ${seasons.map((season, index) => `
+            <details class="media-detail-season">
+              <summary class="media-detail-row">
+                <div class="media-detail-row-main">
+                  <svg class="media-detail-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+                  <div class="media-detail-title">${escapeHtml(`S${String(season.season_number || index + 1).padStart(2, "0")}`)}</div>
+                </div>
+                <div class="media-detail-row-actions">
+                  <span class="media-detail-count">${escapeHtml(`${(season.episodes || []).filter((episode) => owned || episode.owned).length}/${season.episode_count || (season.episodes || []).length || 0}`)}</span>
+                  ${(() => {
+                    const seasonNumber = season.season_number || index + 1;
+                    const key = `season:${seasonNumber}`;
+                    const localOwned = !!localStatuses[key]?.exists;
+                    const url = season.jellyfin_url || localStatuses[key]?.jellyfin_url || owned?.jellyfin_url || details?.jellyfin_url || jellyfinFallbackUrl(item.title || season.search_hint || "");
+                    return renderMediaModalActionButton(
+                      {
+                        title: item.title || season.search_hint || "",
+                        year: item.year || "",
+                        media_type: "tv",
+                        season: seasonNumber,
+                        episode: 1,
+                        poster_url: item.poster_url || "",
+                        backdrop_url: item.backdrop_url || "",
+                      },
+                      owned || season.owned || localOwned,
+                      url
+                    );
+                  })()}
+                </div>
+              </summary>
+              <div class="media-detail-episodes">
+                ${(season.episodes || []).map((episode) => `
+                  <div class="media-detail-episode-row">
+                    <div class="media-detail-episode-title">${escapeHtml(`E${String(episode.episode_number || 0).padStart(2, "0")} • ${episode.title || "Episode"}`)}</div>
+                    <div class="media-detail-row-actions">
+                      <span class="media-detail-date">${escapeHtml(episode.air_date || "")}</span>
+                      ${(() => {
+                        const seasonNumber = episode.season_number || season.season_number || index + 1;
+                        const episodeNumber = episode.episode_number || 1;
+                        const key = `episode:${seasonNumber}:${episodeNumber}`;
+                        const localOwned = !!localStatuses[key]?.exists;
+                        const url = episode.jellyfin_url || localStatuses[key]?.jellyfin_url || season.jellyfin_url || owned?.jellyfin_url || details?.jellyfin_url || jellyfinFallbackUrl(item.title || episode.search_hint || "");
+                        return renderMediaModalActionButton(
+                          {
+                            title: item.title || episode.search_hint || "",
+                            year: item.year || "",
+                            media_type: "tv",
+                            season: seasonNumber,
+                            episode: episodeNumber,
+                            poster_url: item.poster_url || "",
+                            backdrop_url: item.backdrop_url || "",
+                          },
+                          owned || episode.owned || localOwned,
+                          url
+                        );
+                      })()}
+                    </div>
+                  </div>
+                `).join("")}
+              </div>
+            </details>
+          `).join("")}
+        </div>
+      `;
+    }
+
+    function bindSeasonToggleArrows(scope) {
+      scope.querySelectorAll(".media-detail-season").forEach((season) => {
+        const arrow = season.querySelector(".media-detail-arrow");
+        if (!arrow) return;
+        const sync = () => {
+          arrow.innerHTML = season.hasAttribute("open")
+            ? '<path d="M6 9l6 6 6-6"/>'
+            : '<path d="M9 6l6 6-6 6"/>';
+        };
+        sync();
+        season.addEventListener("toggle", sync);
+      });
+    }
+
+    async function openMediaModal(item) {
+      const modal = document.getElementById("media-modal");
+      const hero = document.getElementById("media-modal-hero");
+      const poster = document.getElementById("media-modal-poster");
+      const meta = document.getElementById("media-modal-meta");
+      const title = document.getElementById("media-modal-title");
+      const overview = document.getElementById("media-modal-overview");
+      const actions = document.getElementById("media-modal-actions");
+      if (!modal || !hero || !poster || !meta || !title || !overview || !actions) return;
+      const owned = mediaOwnedItem(item);
+      const backdrop = item.backdrop_url ? `linear-gradient(180deg, rgba(7,16,26,0.08), rgba(7,16,26,0.94)), url("${item.backdrop_url}")` : "";
+      hero.style.backgroundImage = backdrop || "";
+      poster.innerHTML = item.poster_url ? `<img src="${escapeHtml(item.poster_url)}" alt="${escapeHtml(item.title || "Poster")}">` : "";
+      meta.innerHTML = `
+        <div class="library-highlight-meta">
+          ${item.media_type ? `<span class="pill">${escapeHtml(item.media_type === "tv" ? "TV Show" : "Movie")}</span>` : ""}
+          ${item.year ? `<span class="pill">${escapeHtml(item.year)}</span>` : ""}
+          ${item.rating ? `<span class="pill">★ ${escapeHtml(Number(item.rating || 0).toFixed(1))}</span>` : ""}
+          ${owned ? '<span class="pill">In Jellyfin</span>' : ""}
+        </div>
+      `;
+      title.textContent = item.title || "Untitled";
+      overview.textContent = (item.overview || "").trim() || "No overview available.";
+      actions.innerHTML = '<div class="media-detail-empty">Loading details…</div>';
+      modal.classList.add("is-open");
+      modal.setAttribute("aria-hidden", "false");
+      document.body.style.overflow = "hidden";
+      window.__openMediaItem = item;
+      let details = { seasons: [] };
+      try {
+        const detailsResponse = await fetch(`/api/media/details?provider=${encodeURIComponent(item.provider || "tmdb")}&provider_id=${encodeURIComponent(item.provider_id || "")}&media_type=${encodeURIComponent(item.media_type || "movie")}`);
+        details = detailsResponse.ok ? await detailsResponse.json() : { seasons: [] };
+      } catch (_error) {
+        details = { seasons: [] };
+      }
+      const statusRequests = [
+        {
+          key: "primary",
+          payload: {
+            title: item.title || "",
+            year: item.year || "",
+            media_type: item.media_type || "movie"
+          }
+        }
+      ];
+      if ((item.media_type || "movie") === "tv") {
+        (details.seasons || []).forEach((season, index) => {
+          const seasonNumber = season.season_number || index + 1;
+          statusRequests.push({
+            key: `season:${seasonNumber}`,
+            payload: {
+              title: item.title || season.search_hint || "",
+              year: item.year || "",
+              media_type: "tv",
+              season: seasonNumber
+            }
+          });
+          (season.episodes || []).forEach((episode) => {
+            const episodeNumber = episode.episode_number || 1;
+            const episodeSeasonNumber = episode.season_number || seasonNumber;
+            statusRequests.push({
+              key: `episode:${episodeSeasonNumber}:${episodeNumber}`,
+              payload: {
+                title: item.title || episode.search_hint || "",
+                year: item.year || "",
+                media_type: "tv",
+                season: episodeSeasonNumber,
+                episode: episodeNumber
+              }
+            });
+          });
+        });
+      }
+      const localStatuses = await fetchLocalMediaStatuses(statusRequests);
+      if (window.__openMediaItem?.id !== item.id) {
+        return;
+      }
+      const primaryLocalOwned = !!localStatuses.primary?.exists;
+      const primaryAction = renderMediaModalActionButton(
+        {
+          title: item.title || "",
+          year: item.year || "",
+          media_type: item.media_type || "movie",
+          poster_url: item.poster_url || "",
+          backdrop_url: item.backdrop_url || "",
+        },
+        owned || primaryLocalOwned,
+        owned?.jellyfin_url || details?.jellyfin_url || localStatuses.primary?.jellyfin_url || jellyfinFallbackUrl(item.title || "")
+      );
+      meta.innerHTML = `
+        <div class="media-modal-meta">
+          <div class="library-highlight-meta">
+            ${item.media_type ? `<span class="pill">${escapeHtml(item.media_type === "tv" ? "TV Show" : "Movie")}</span>` : ""}
+            ${item.year ? `<span class="pill">${escapeHtml(item.year)}</span>` : ""}
+            ${item.rating ? `<span class="pill">★ ${escapeHtml(Number(item.rating || 0).toFixed(1))}</span>` : ""}
+            ${owned ? '<span class="pill">In Jellyfin</span>' : ""}
+          </div>
+          <div class="media-modal-actions">${primaryAction}</div>
+        </div>
+      `;
+      if ((item.media_type || "movie") === "tv") {
+        actions.innerHTML = renderTvDetailActions(item, details, owned, localStatuses);
+        bindSeasonToggleArrows(actions);
+      } else {
+        actions.innerHTML = "";
+      }
+      bindMediaActions(actions);
+      bindMediaActions(meta);
+    }
+
+    function closeMediaModal() {
+      const modal = document.getElementById("media-modal");
+      if (!modal) return;
+      modal.classList.remove("is-open");
+      modal.setAttribute("aria-hidden", "true");
+      document.body.style.overflow = "";
+      window.__openMediaItem = null;
+    }
+
+    function readSessionJson(key, fallback) {
+      try {
+        const raw = sessionStorage.getItem(key);
+        return raw ? JSON.parse(raw) : fallback;
+      } catch (_error) {
+        return fallback;
+      }
+    }
+
+    function writeSessionJson(key, value) {
+      try {
+        sessionStorage.setItem(key, JSON.stringify(value));
+      } catch (_error) {
+        // Session persistence is a convenience; the UI still works without it.
+      }
+    }
+
+    function restoreAutoDownloadRequests() {
+      if (!Array.isArray(window.__autoDownloadRequests)) {
+        window.__autoDownloadRequests = readSessionJson(AUTO_DOWNLOAD_REQUESTS_KEY, []);
+      }
+      return window.__autoDownloadRequests;
+    }
+
+    function persistAutoDownloadRequests() {
+      writeSessionJson(AUTO_DOWNLOAD_REQUESTS_KEY, window.__autoDownloadRequests || []);
+    }
+
+    function activeAutoDownloadToasts() {
+      const now = Date.now();
+      const active = readSessionJson(AUTO_DOWNLOAD_TOASTS_KEY, []).filter((toast) => Number(toast.expires_at || 0) > now);
+      writeSessionJson(AUTO_DOWNLOAD_TOASTS_KEY, active);
+      return active;
+    }
+
+    function upsertAutoDownloadToast(toast) {
+      const active = activeAutoDownloadToasts().filter((item) => item.id !== toast.id);
+      active.push(toast);
+      writeSessionJson(AUTO_DOWNLOAD_TOASTS_KEY, active);
+    }
+
+    function removeAutoDownloadToast(id) {
+      writeSessionJson(AUTO_DOWNLOAD_TOASTS_KEY, activeAutoDownloadToasts().filter((toast) => toast.id !== id));
+    }
+
+    function showAutoDownloadToast(title, copy, options = {}) {
+      const stack = document.getElementById("auto-download-toasts");
+      if (!stack) return null;
+      const id = options.id || `toast-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const createdAt = Number(options.created_at || Date.now());
+      const expiresAt = Number(options.expires_at || createdAt + AUTO_DOWNLOAD_TOAST_DURATION);
+      if (options.persist !== false) {
+        upsertAutoDownloadToast({ id, title, copy, created_at: createdAt, expires_at: expiresAt });
+      }
+      const elapsed = Math.max(0, Date.now() - createdAt);
+      const toast = document.createElement("div");
+      toast.className = "auto-download-toast";
+      toast.innerHTML = `
+        <button class="auto-download-close" type="button" aria-label="Dismiss">×</button>
+        <div class="auto-download-title">${escapeHtml(title || "Auto download")}</div>
+        <div class="auto-download-copy">${escapeHtml(copy || "Started in the background.")}</div>
+        <div class="auto-download-progress" style="animation-duration: ${AUTO_DOWNLOAD_TOAST_DURATION}ms; animation-delay: -${Math.min(elapsed, AUTO_DOWNLOAD_TOAST_DURATION)}ms;"></div>
+      `;
+      stack.appendChild(toast);
+      let timer = null;
+      const remove = () => {
+        if (timer) clearTimeout(timer);
+        removeAutoDownloadToast(id);
+        toast.remove();
+      };
+      toast.querySelector(".auto-download-close")?.addEventListener("click", remove);
+      timer = setTimeout(remove, Math.max(0, expiresAt - Date.now()));
+      return {
+        dismiss: remove
+      };
+    }
+
+    function restoreActiveAutoDownloadToasts() {
+      activeAutoDownloadToasts().forEach((toast) => {
+        showAutoDownloadToast(toast.title, toast.copy, { ...toast, persist: false });
+      });
+    }
+
+    function taskMatchesAutoFind(task, payload) {
+      const expectedTitle = cleanMediaTitle(payload?.title || "").toLowerCase();
+      const taskTitle = cleanMediaTitle(task?.title || task?.series_name || "").toLowerCase();
+      if (expectedTitle && taskTitle && !taskTitle.includes(expectedTitle) && !expectedTitle.includes(taskTitle)) {
+        return false;
+      }
+      if (payload?.season && String(task?.season || task?.metadata?.season || "") !== String(payload.season)) {
+        return false;
+      }
+      if (payload?.episode && String(task?.episode || task?.metadata?.episode || "") !== String(payload.episode)) {
+        return false;
+      }
+      return ["queued", "running", "completed", "failed", "stopped"].includes(String(task?.status || ""));
+    }
+
+    function autoDownloadLabel(payload) {
+      const parts = [payload?.title || "Auto download"];
+      if (payload?.season && payload?.episode) {
+        parts.push(`S${String(payload.season).padStart(2, "0")}E${String(payload.episode).padStart(2, "0")}`);
+      }
+      return parts.join(" ");
+    }
+
+    function addAutoDownloadRequest(payload) {
+      restoreAutoDownloadRequests();
+      const createdAt = new Date();
+      const request = {
+        id: `auto-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        title: autoDownloadLabel(payload),
+        status: "starting",
+        created_at: createdAt.toISOString(),
+        logs: [`${createdAt.toLocaleTimeString()} Created auto-download request.`],
+        payload,
+      };
+      window.__autoDownloadRequests.unshift(request);
+      persistAutoDownloadRequests();
+      renderAutoDownloadRequests();
+      return request;
+    }
+
+    function appendAutoDownloadLog(request, message, status) {
+      if (!request) return;
+      if (status) request.status = status;
+      request.logs.push(`${new Date().toLocaleTimeString()} ${message}`);
+      persistAutoDownloadRequests();
+      renderAutoDownloadRequests();
+    }
+
+    function autoRequestStatusClass(status) {
+      if (status === "completed" || status === "queued") return "completed";
+      if (status === "failed" || status === "stopped") return "failed";
+      return "queued";
+    }
+
+    function reconcileAutoDownloadRequests() {
+      const requests = restoreAutoDownloadRequests();
+      if (!requests.length || !window.__taskState) return;
+      let changed = false;
+      requests.forEach((request) => {
+        if (!request || ["completed", "failed", "stopped"].includes(request.status)) return;
+        const match = allTasks().find((task) => taskMatchesAutoFind(task, request.payload || {}));
+        if (!match) return;
+        const status = String(match.status || "queued");
+        const alreadyLinked = request.task_id === match.id;
+        request.task_id = match.id;
+        if (status === "completed") {
+          request.status = "completed";
+          if (!request.completed_logged) {
+            request.logs.push(`${new Date().toLocaleTimeString()} Download completed as ${match.title || match.id}.`);
+            request.completed_logged = true;
+          }
+        } else if (status === "failed" || status === "stopped") {
+          request.status = status;
+          if (!request.finished_logged) {
+            request.logs.push(`${new Date().toLocaleTimeString()} Download ${status}: ${match.error || match.title || match.id}.`);
+            request.finished_logged = true;
+          }
+        } else {
+          request.status = status === "running" ? "running" : "queued";
+          if (!alreadyLinked && !request.queued_logged) {
+            request.logs.push(`${new Date().toLocaleTimeString()} Stream detected and queued as ${match.title || match.id}.`);
+            request.queued_logged = true;
+          }
+        }
+        changed = true;
+      });
+      if (changed) {
+        persistAutoDownloadRequests();
+        renderAutoDownloadRequests();
+      }
+    }
+
+    function formatAutoDownloadTimestamp(value) {
+      const date = value ? new Date(value) : null;
+      if (!date || Number.isNaN(date.getTime())) {
+        return "";
+      }
+      return date.toLocaleString([], {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+      });
+    }
+
+    function renderAutoDownloadRequests() {
+      const list = document.getElementById("auto-download-request-list");
+      if (!list) return;
+      const requests = restoreAutoDownloadRequests();
+      if (!requests.length) {
+        list.innerHTML = '<div class="empty">No auto-download requests are running.</div>';
+        return;
+      }
+      list.innerHTML = requests.map((request) => `
+        <details class="auto-request-item">
+          <summary class="auto-request-top">
+            <time class="auto-request-time">${escapeHtml(formatAutoDownloadTimestamp(request.created_at))}</time>
+            <div class="auto-request-title">${escapeHtml(request.title)}</div>
+            <span class="status-pill ${escapeHtml(autoRequestStatusClass(request.status))}">${escapeHtml(request.status)}</span>
+          </summary>
+          <pre class="auto-request-log">${escapeHtml((request.logs || []).join("\\n"))}</pre>
+        </details>
+      `).join("");
+    }
+
+    function waitForAutoDownloadQueued(payload, existingIds, request) {
+      const startedAt = Date.now();
+      return new Promise((resolve) => {
+        const timer = setInterval(async () => {
+          try {
+            const response = await fetch("/api/tasks");
+            if (response.ok) {
+              window.__taskState = await response.json();
+              renderTasks();
+              const match = allTasks().find((task) => !existingIds.has(task.id) && taskMatchesAutoFind(task, payload));
+              if (match) {
+                clearInterval(timer);
+                request.task_id = match.id;
+                request.queued_logged = true;
+                appendAutoDownloadLog(request, `Stream detected and queued as ${match.title || match.id}.`, match.status === "running" ? "running" : match.status === "completed" ? "completed" : "queued");
+                resolve(match);
+                return;
+              }
+            }
+          } catch (_error) {
+            // Keep waiting; the regular refresh loop will also recover state.
+          }
+          if (Date.now() - startedAt > 45000) {
+            clearInterval(timer);
+            appendAutoDownloadLog(request, "Timed out waiting for a queued stream. The browser may still be working.", "failed");
+            resolve(null);
+          }
+        }, 1400);
+      });
+    }
+
+    function bindMediaActions(scope) {
+      scope.querySelectorAll("[data-media-modal]").forEach((node) => {
+        node.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const encoded = node.dataset.mediaModal;
+          if (!encoded) return;
+          openMediaModal(JSON.parse(decodeURIComponent(encoded)));
+        });
+      });
+      scope.querySelectorAll("[data-media-autofind]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const encoded = button.dataset.mediaAutofind;
+          if (!encoded) return;
+          const payload = JSON.parse(decodeURIComponent(encoded));
+          const existingIds = new Set(allTasks().map((task) => task.id));
+          const request = addAutoDownloadRequest(payload);
+          showAutoDownloadToast(payload.title || "Auto download", "Auto download started in the background.");
+          button.disabled = true;
+          try {
+            appendAutoDownloadLog(request, "Sending request to the remote browser.", "starting");
+            const response = await fetch("/api/media/auto-find", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ...payload, site: browserSiteSelect?.value || "yflix" })
+            });
+            if (!response.ok) {
+              throw new Error(`Auto-find failed with ${response.status}`);
+            }
+            const result = await response.json();
+            appendAutoDownloadLog(request, `Browser command ${result.browser_command_id || ""} issued for ${result.site}: ${result.search_hint || payload.title || "title"}.`, "searching");
+            appendAutoDownloadLog(request, "Waiting for the stream detector to report an HLS playlist.", "searching");
+            try {
+              await navigator.clipboard.writeText(result.search_hint || payload.title || "");
+            } catch (_error) {
+              // Clipboard is optional; the hint still renders in the side panel.
+            }
+            closeMediaModal();
+            await waitForAutoDownloadQueued(payload, existingIds, request);
+          } catch (error) {
+            console.error(error);
+            appendAutoDownloadLog(request, "Auto download could not start. Check Mullvad and the remote browser.", "failed");
+          } finally {
+            button.disabled = false;
+          }
+        });
+      });
+    }
+
+    function renderMediaSections() {
+      const container = document.getElementById("media-sections");
+      if (!container) return;
+      if (currentMediaView() === "download") {
+        container.innerHTML = "";
+        return;
+      }
+      const state = currentMediaView() === "library" ? window.__libraryState : window.__discoverState;
+      if (!state?.configured && !(state?.sections || []).length) {
+        const sourceLabel = currentMediaView() === "library" ? "Jellyfin" : "TMDb";
+        container.innerHTML = `<section class="library-section"><div class="media-card-empty">${escapeHtml(sourceLabel)} is not configured or not reachable through Mullvad yet.</div></section>`;
+        renderMediaHighlight();
+        return;
+      }
+      const sections = state.sections || [];
+      const query = (state.query || "").trim();
+      const useGrid = currentMediaView() === "library" && !!query;
+      if (query) {
+        const mergedItems = sections.flatMap((section) => section.items || []);
+        container.innerHTML = `
+          <section class="library-section">
+            <header class="panel-header premium-header">
+              <div>
+                <h3 class="section-title">Results</h3>
+              </div>
+            </header>
+            <div class="media-grid">
+              ${mergedItems.length ? mergedItems.map(mediaCard).join("") : '<div class="media-card-empty">No matching items found.</div>'}
+            </div>
+          </section>
+        `;
+        bindMediaActions(container);
+        setMediaArtworkMap();
+        renderTasks();
+        return;
+      }
+      container.innerHTML = sections.map((section) => `
+        <section class="library-section">
+          <header class="panel-header premium-header">
+            <div>
+              <h3 class="section-title">${escapeHtml(section.title || "Section")}</h3>
+              ${currentMediaView() === "library" ? '<p class="section-copy">Pulled directly from Jellyfin.</p>' : ""}
+            </div>
+          </header>
+          <div class="${useGrid ? "media-grid" : "media-rail"}">
+            ${(section.items || []).length ? (section.items || []).map(mediaCard).join("") : '<div class="media-card-empty">No items in this section.</div>'}
+          </div>
+        </section>
+      `).join("");
+      bindMediaActions(container);
+      renderMediaHighlight();
+      setMediaArtworkMap();
+      renderTasks();
+    }
+
+    async function refreshMediaData(force = false) {
+      if (activePageName() !== "library" && !force) {
+        return;
+      }
+      const query = document.getElementById("media-search-input")?.value?.trim() || "";
+      const search = query ? `?query=${encodeURIComponent(query)}` : "";
+      const [discoverResponse, libraryResponse] = await Promise.all([
+        fetch(`/api/media/discover${search}`),
+        fetch(`/api/media/library${search}`),
+      ]);
+      window.__discoverState = discoverResponse.ok ? await discoverResponse.json() : { configured: false, sections: [] };
+      window.__libraryState = libraryResponse.ok ? await libraryResponse.json() : { configured: false, sections: [] };
+      renderMediaSections();
     }
 
     function youtubeStatusLabel(status) {
@@ -2562,6 +5942,122 @@ INDEX_HTML = """
       renderGeneralSettings();
     }
 
+    function applyMullvadUiState(connected) {
+      const outboundIds = [
+        "media-search-submit",
+        "youtube-lookup-btn",
+        "youtube-refresh-btn",
+        "youtube-subscribe-btn",
+        "youtube-queue-btn",
+        "music-refresh-queue"
+      ];
+      outboundIds.forEach((id) => {
+        const node = document.getElementById(id);
+        if (node) {
+          node.disabled = !connected;
+          node.title = connected ? "" : "Connect Mullvad before using internet features";
+        }
+      });
+      const siteSelect = document.getElementById("browser-site-select");
+      if (siteSelect) {
+        siteSelect.disabled = !connected;
+        siteSelect.title = connected ? "" : "Connect Mullvad before browsing";
+      }
+      document.querySelectorAll(".media-card-btn[data-media-autofind]").forEach((button) => {
+        button.disabled = !connected;
+        button.title = connected ? "" : "Connect Mullvad before using auto-find";
+      });
+      renderBrowserAvailability(connected);
+    }
+
+    function renderBrowserAvailability(connected) {
+      const blocked = document.getElementById("browser-blocked");
+      const blockedCopy = document.getElementById("browser-blocked-copy");
+      if (!browserFrame || !blocked) {
+        return;
+      }
+      if (!connected) {
+        browserFrame.classList.add("is-hidden");
+        if (browserFrame.src !== "about:blank") {
+          browserFrame.src = "about:blank";
+        }
+        blocked.classList.add("is-visible");
+        if (blockedCopy) {
+          blockedCopy.textContent = "Connect Mullvad to start the remote browser and reach internet destinations.";
+        }
+        window.__browserWasBlocked = true;
+        return;
+      }
+
+      blocked.classList.remove("is-visible");
+      browserFrame.classList.remove("is-hidden");
+      const desiredSrc = browserFrame.dataset.browserSrc || "__BROWSER_URL__";
+      if (window.__browserWasBlocked || browserFrame.src === "about:blank") {
+        browserFrame.src = desiredSrc;
+      } else {
+        try {
+          const current = new URL(browserFrame.src);
+          if (!current.hostname) {
+            browserFrame.src = desiredSrc;
+          }
+        } catch (_error) {
+          browserFrame.src = desiredSrc;
+        }
+      }
+      window.__browserWasBlocked = false;
+    }
+
+    function renderSystemSummary() {
+      const summary = window.__systemSummary;
+      if (!summary) {
+        return;
+      }
+      const free = formatBytes(summary.disk?.free);
+      const total = formatBytes(summary.disk?.total);
+      const storageLine = `${free} free`;
+      const storageDetail = `${free} free of ${total}`;
+      const usedBytes = Number(summary.disk?.used || 0);
+      const totalBytes = Number(summary.disk?.total || 0);
+      const usedPercent = totalBytes > 0 ? Math.max(0, Math.min(100, (usedBytes / totalBytes) * 100)) : 0;
+      const connected = !!summary.mullvad?.connected;
+      const mullvadBanner = document.getElementById("mullvad-banner");
+      const sidebarValue = document.getElementById("sidebar-storage-value");
+      const sidebarDetail = document.getElementById("sidebar-storage-detail");
+      const sidebarPercent = document.getElementById("sidebar-storage-percent");
+      const sidebarCapacity = document.getElementById("sidebar-storage-capacity");
+      const sidebarBar = document.getElementById("sidebar-storage-bar");
+      if (sidebarValue) sidebarValue.textContent = `${Math.round(usedPercent)}%`;
+      if (sidebarDetail) sidebarDetail.textContent = storageDetail;
+      if (sidebarPercent) sidebarPercent.textContent = `${Math.round(usedPercent)}% used`;
+      if (sidebarCapacity) sidebarCapacity.textContent = `${formatBytes(usedBytes)} of ${total}`;
+      if (sidebarBar) sidebarBar.style.width = `${usedPercent.toFixed(1)}%`;
+      const jellyfinSummary = document.getElementById("jellyfin-settings-summary");
+      const tmdbSummary = document.getElementById("tmdb-settings-summary");
+      if (jellyfinSummary) {
+        jellyfinSummary.textContent = summary.jellyfin?.configured
+          ? `Jellyfin connected at ${summary.jellyfin.url}`
+          : "Set JELLYFIN_URL to surface library handoff links here.";
+      }
+      if (tmdbSummary) {
+        tmdbSummary.textContent = summary.tmdb?.configured
+          ? "TMDb discover rails are enabled."
+          : "Set TMDB_API_KEY to enable discover rails and poster metadata.";
+      }
+      if (mullvadBanner) {
+        mullvadBanner.classList.toggle("is-visible", !connected);
+      }
+      applyMullvadUiState(connected);
+    }
+
+    async function refreshSystemSummary() {
+      const response = await fetch("/api/system/summary");
+      if (!response.ok) {
+        return;
+      }
+      window.__systemSummary = await response.json();
+      renderSystemSummary();
+    }
+
     async function refreshYouTubeState() {
       const response = await fetch("/api/youtube/state");
       window.__youtubeState = await response.json();
@@ -2583,9 +6079,14 @@ INDEX_HTML = """
       const state = await response.json();
       window.__browserState = state;
       updateBrowserButtons(state);
+      const mullvadConnected = !!window.__systemSummary?.mullvad?.connected;
       const streams = state.streams || [];
       document.getElementById("browser-stream-count").textContent = `${streams.length} detected`;
       const list = document.getElementById("browser-stream-list");
+      if (!mullvadConnected) {
+        list.innerHTML = '<div class="empty">Connect Mullvad to enable the remote browser and stream detection.</div>';
+        return;
+      }
       if (!streams.length) {
         list.innerHTML = '<div class="empty">No streams detected yet. Start playback in the remote browser.</div>';
         return;
@@ -2626,15 +6127,143 @@ INDEX_HTML = """
       });
     }
 
-    async function refresh() {
-      const response = await fetch("/api/tasks");
-      window.__taskState = await response.json();
-      renderTasks();
-      await refreshBrowserState();
-      await refreshYouTubeState();
-      await refreshMusicState();
-      await refreshGeneralSettings();
+    function guessTitleFromUrl(url) {
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol === "magnet:") {
+          return "Magnet link";
+        }
+        const pathname = parsed.pathname.split("/").filter(Boolean).pop() || parsed.hostname;
+        return decodeURIComponent(pathname.replace(/[-_]+/g, " "));
+      } catch (_error) {
+        if (url.startsWith("magnet:")) {
+          return "Magnet link";
+        }
+        return "Queued download";
+      }
     }
+
+    async function refresh() {
+      if (window.__refreshInFlight) {
+        return;
+      }
+      window.__refreshInFlight = true;
+      try {
+        updatePageVisibilityState();
+        await refreshSystemSummary();
+        const response = await fetch("/api/tasks");
+        window.__taskState = await response.json();
+        notifyTaskStatusChanges();
+        reconcileAutoDownloadRequests();
+        renderTasks();
+        if ((activePageName() === "library" || activePageName() === "downloads") && !window.__mediaLoaded) {
+          await refreshMediaData(true);
+          window.__mediaLoaded = true;
+        }
+        await refreshBrowserState();
+        await refreshYouTubeState();
+        await refreshMusicState();
+        await refreshGeneralSettings();
+      } finally {
+        window.__refreshInFlight = false;
+      }
+    }
+
+    function handleDownloadSearchInput(value) {
+      window.__downloadSearch = value || "";
+      const page = document.getElementById("downloads-page-search");
+      if (page && page.value !== window.__downloadSearch) page.value = window.__downloadSearch;
+      renderTasks();
+    }
+
+    document.getElementById("downloads-page-search")?.addEventListener("input", (event) => {
+      handleDownloadSearchInput(event.target.value || "");
+    });
+
+    document.querySelectorAll("[data-download-state-filter]").forEach((button) => {
+      button.addEventListener("click", () => {
+        window.__downloadStateFilter = button.dataset.downloadStateFilter || "all";
+        document.querySelectorAll("[data-download-state-filter]").forEach((node) => {
+          node.classList.toggle("is-active", node === button);
+        });
+        renderTasks();
+      });
+    });
+
+    document.querySelectorAll("[data-download-type-filter]").forEach((button) => {
+      button.addEventListener("click", () => {
+        window.__downloadTypeFilter = button.dataset.downloadTypeFilter || "all";
+        document.querySelectorAll("[data-download-type-filter]").forEach((node) => {
+          node.classList.toggle("is-active", node === button);
+        });
+        renderTasks();
+      });
+    });
+
+    document.getElementById("browser-reconnect-btn")?.addEventListener("click", async (event) => {
+      event.currentTarget.disabled = true;
+      try {
+        await refreshSystemSummary();
+        if (window.__systemSummary?.mullvad?.connected) {
+          renderBrowserAvailability(true);
+          await refreshBrowserState();
+        }
+      } finally {
+        event.currentTarget.disabled = false;
+      }
+    });
+
+    document.querySelectorAll("[data-media-view]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        switchMediaView(button.dataset.mediaView || "discover", { updateHistory: true, historyMode: "push" });
+        if (!window.__mediaLoaded) {
+          await refreshMediaData(true);
+          window.__mediaLoaded = true;
+        }
+      });
+    });
+
+    document.getElementById("media-search-form")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await refreshMediaData(true);
+      window.__mediaLoaded = true;
+    });
+
+    document.getElementById("media-modal-close")?.addEventListener("click", closeMediaModal);
+    document.getElementById("media-modal")?.addEventListener("click", (event) => {
+      if (event.target.id === "media-modal") {
+        closeMediaModal();
+      }
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        closeMediaModal();
+      }
+    });
+    window.addEventListener("popstate", () => {
+      const path = window.location.pathname;
+      if (path === "/movies-tv/library") {
+        switchMediaView("library", { updateHistory: false });
+      } else if (path === "/movies-tv/download") {
+        switchMediaView("download", { updateHistory: false });
+      } else if (path === "/movies-tv/discover" || path === "/movies-tv") {
+        switchMediaView("discover", { updateHistory: false });
+      }
+    });
+
+    document.getElementById("mobile-nav-toggle")?.addEventListener("click", (event) => {
+      const isOpen = document.body.classList.toggle("sidebar-open");
+      event.currentTarget.setAttribute("aria-expanded", String(isOpen));
+    });
+
+    document.getElementById("sidebar-collapse-btn")?.addEventListener("click", () => {
+      const sidebar = document.getElementById("sidebar-nav");
+      if (!sidebar) return;
+      const collapsed = sidebar.classList.toggle("is-collapsed");
+      document.body.classList.toggle("sidebar-collapsed", collapsed);
+      localStorage.setItem("isambard.sidebarCollapsed", collapsed ? "1" : "0");
+      document.getElementById("sidebar-collapse-btn")?.setAttribute("aria-pressed", collapsed ? "true" : "false");
+    });
 
     document.getElementById("youtube-lookup-form")?.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -2739,8 +6368,23 @@ INDEX_HTML = """
     });
 
     bindMusicEvents();
+    if (localStorage.getItem("isambard.sidebarCollapsed") !== "0") {
+      document.getElementById("sidebar-nav")?.classList.add("is-collapsed");
+      document.body.classList.add("sidebar-collapsed");
+      document.getElementById("sidebar-collapse-btn")?.setAttribute("aria-pressed", "true");
+    }
+    restoreAutoDownloadRequests();
+    restoreActiveAutoDownloadToasts();
+    switchMediaView("__INITIAL_MEDIA_VIEW__", { updateHistory: false });
+    updatePageVisibilityState();
     renderGeneralSettings();
+    renderSystemSummary();
     refresh();
+    setInterval(() => {
+      if (currentMediaView() === "discover") {
+        setHeroCarouselIndex((window.__heroCarouselIndex || 0) + 1);
+      }
+    }, 6500);
     setInterval(refresh, 1500);
   </script>
 </body>

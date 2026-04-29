@@ -37,6 +37,10 @@ securityContext: {}
 
 gluetun:
   enabled: true
+  existingSecret: ""
+  existingSecretKeys:
+    wireguardPrivateKey: WIREGUARD_PRIVATE_KEY
+    wireguardAddresses: WIREGUARD_ADDRESSES
   securityContext:
     capabilities:
       add:
@@ -52,6 +56,10 @@ app:
     BROWSER_URL: https://isambard-browser.example.com
     BROWSER_USER: guac
     BROWSER_PASSWORD: guac
+    JELLYFIN_URL: ""
+    JELLYFIN_API_KEY: ""
+    TMDB_API_KEY: ""
+  secretEnv: []
 
 browser:
   shmSize: 1Gi
@@ -76,6 +84,10 @@ persistence:
     accessMode: ReadWriteOnce
     size: 50Gi
     storageClassName: ""
+    nfs:
+      enabled: false
+      server: ""
+      path: ""
 
 service:
   app:

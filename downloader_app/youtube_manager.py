@@ -80,6 +80,7 @@ class YouTubeManager:
         downloads_dir: Path,
         queue_video: Callable[[dict[str, Any]], Any],
         video_status: Callable[[str], str],
+        require_outbound: Callable[[str], None] | None = None,
     ) -> None:
         self.downloads_dir = downloads_dir
         self.cache_file = downloads_dir / ".youtube-cache.json"
@@ -91,6 +92,7 @@ class YouTubeManager:
         self._lock = threading.RLock()
         self._queue_video = queue_video
         self._video_status = video_status
+        self._require_outbound = require_outbound or (lambda _context: None)
         self._load_state()
         poll_seconds = max(300, int(os.environ.get("YOUTUBE_SUBSCRIPTION_POLL_SECONDS", "1800")))
         self._poll_seconds = poll_seconds
@@ -107,6 +109,7 @@ class YouTubeManager:
         }
 
     def lookup(self, url: str, refresh: bool = False) -> YouTubeLookup:
+        self._require_outbound("YouTube lookup")
         cache_key = self._cache_key(url)
         with self._lock:
             if not refresh and cache_key in self.lookup_cache:
@@ -124,6 +127,7 @@ class YouTubeManager:
         return lookup
 
     def queue_selected(self, cache_key: str, video_ids: list[str]) -> list[dict[str, Any]]:
+        self._require_outbound("YouTube queueing")
         with self._lock:
             raw_lookup = self.lookup_cache.get(cache_key)
         if raw_lookup is None:
@@ -148,6 +152,7 @@ class YouTubeManager:
         return queued
 
     def subscribe(self, cache_key: str) -> dict[str, Any]:
+        self._require_outbound("YouTube subscriptions")
         with self._lock:
             raw_lookup = self.lookup_cache.get(cache_key)
             if raw_lookup is None:
@@ -170,6 +175,7 @@ class YouTubeManager:
         return subscription.to_dict()
 
     def refresh_subscription(self, subscription_id: str) -> dict[str, Any]:
+        self._require_outbound("YouTube subscription refresh")
         with self._lock:
             subscription = next((item for item in self.subscriptions if item.id == subscription_id), None)
         if subscription is None:
@@ -193,6 +199,11 @@ class YouTubeManager:
             time.sleep(self._poll_seconds)
             with self._lock:
                 subscriptions = list(self.subscriptions)
+            try:
+                self._require_outbound("YouTube subscription polling")
+            except RuntimeError as exc:
+                LOGGER.warning("%s", exc)
+                continue
             for subscription in subscriptions:
                 try:
                     self._refresh_subscription(subscription)

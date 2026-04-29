@@ -9,7 +9,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import httpx
 from fastapi import HTTPException
@@ -62,11 +62,12 @@ DEFAULT_SETTINGS: dict[str, object] = {
 
 
 class MusicManager:
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, require_outbound: Callable[[str], None] | None = None) -> None:
         self.data_dir = data_dir
         self.db_path = data_dir / "music.db"
         self._queue: list[MusicQueueItem] = []
         self._lock = asyncio.Lock()
+        self._require_outbound = require_outbound or (lambda _context: None)
         self.ensure_db()
 
     def ensure_db(self) -> None:
@@ -153,6 +154,7 @@ class MusicManager:
         return current
 
     async def fetch_metadata(self, url: str) -> MusicMetadataSummary:
+        self._require_outbound("Music metadata fetch")
         entity_type, entity_id = self._parse_spotify_target(url)
         settings = self.get_settings()
         api_base_url = str(settings.get("spotFetchAPIUrl") or DEFAULT_SPOTFETCH_API_URL)
@@ -228,6 +230,7 @@ class MusicManager:
             self._queue.clear()
 
     async def start_queue_item(self, item_id: str) -> dict[str, object]:
+        self._require_outbound("Music download")
         async with self._lock:
             item = next((candidate for candidate in self._queue if candidate.id == item_id), None)
             if item is None:

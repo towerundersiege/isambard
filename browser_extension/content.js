@@ -5,6 +5,8 @@
   window.__isambardDownloaderInstalled = true;
   const SUPPORTED_HOSTS = new Set(["yflix.to", "dashflix.top"]);
   const HOST = location.hostname;
+  let yflixAutoStarted = false;
+  let yflixAutoAttempts = 0;
 
   function parseSeasonEpisode() {
     if (HOST === "yflix.to") {
@@ -17,9 +19,9 @@
   }
 
   function parseSeasonEpisodeForYflix() {
-    const hashMatch = location.hash.match(/(?:#|&)ep=(\d+),(\d+)/i);
+    const hashMatch = location.hash.match(/(?:#|&)ep=(\d+)(?:,(\d+))?/i);
     if (hashMatch) {
-      return { season: hashMatch[1], episode: hashMatch[2] };
+      return { season: hashMatch[1], episode: hashMatch[2] || null };
     }
     return parseSeasonEpisodeFallback();
   }
@@ -139,8 +141,19 @@
   }
 
   function extractSiteSpecificTitle() {
+    if (HOST === "yflix.to") {
+      return extractYflixTitle();
+    }
     if (HOST === "dashflix.top") {
       return extractDashflixTitle();
+    }
+    return "";
+  }
+
+  function extractYflixTitle() {
+    const title = normalizeVisibleText(document.querySelector("#filmDetail h1.title, h1[itemprop='name']")?.textContent || "");
+    if (title) {
+      return title;
     }
     return "";
   }
@@ -271,6 +284,166 @@
     }
   }
 
+  function yflixAutoIntentFromUrl() {
+    if (HOST !== "yflix.to") {
+      return null;
+    }
+    const params = new URLSearchParams(location.search);
+    const title = normalizeVisibleText(params.get("isambard_title") || "");
+    const keyword = normalizeVisibleText(params.get("keyword") || "");
+    if (!title && !keyword) {
+      return null;
+    }
+    return {
+      title: title || keyword,
+      year: normalizeVisibleText(params.get("isambard_year") || ""),
+      media_type: normalizeVisibleText(params.get("isambard_media_type") || "movie").toLowerCase(),
+      season: normalizeVisibleText(params.get("isambard_season") || ""),
+      episode: normalizeVisibleText(params.get("isambard_episode") || ""),
+      poster_url: params.get("isambard_poster_url") || "",
+      backdrop_url: params.get("isambard_backdrop_url") || ""
+    };
+  }
+
+  function normalizeMatchText(value) {
+    return normalizeVisibleText(value)
+      .toLowerCase()
+      .replace(/&/g, "and")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  function yflixResultCandidates() {
+    return Array.from(document.querySelectorAll(".film-section .item, .item"))
+      .map((item) => {
+        const titleLink = item.querySelector(".info a.title, a.title");
+        const posterLink = item.querySelector("a.poster[href*='/watch/']");
+        const href = titleLink?.href || posterLink?.href || "";
+        const metadata = Array.from(item.querySelectorAll(".metadata span")).map((node) => normalizeVisibleText(node.textContent || ""));
+        return {
+          href,
+          title: normalizeVisibleText(titleLink?.textContent || ""),
+          media_type: metadata.some((text) => /^tv$/i.test(text)) ? "tv" : "movie",
+          metadata
+        };
+      })
+      .filter((item) => item.href && item.title);
+  }
+
+  function scoreYflixCandidate(candidate, intent) {
+    const wantedTitle = normalizeMatchText(intent.title);
+    const candidateTitle = normalizeMatchText(candidate.title);
+    let score = 0;
+    if (candidateTitle === wantedTitle) {
+      score += 100;
+    } else if (candidateTitle.includes(wantedTitle) || wantedTitle.includes(candidateTitle)) {
+      score += 45;
+    }
+    if (intent.media_type && candidate.media_type === intent.media_type) {
+      score += 30;
+    }
+    if (intent.year && candidate.metadata.includes(intent.year)) {
+      score += 20;
+    }
+    return score;
+  }
+
+  function buildYflixWatchUrl(href, intent) {
+    const url = new URL(href, location.href);
+    if (intent.media_type === "tv") {
+      url.hash = `ep=${intent.season || "1"},${intent.episode || "1"}`;
+    } else {
+      url.hash = "ep=1";
+    }
+    url.searchParams.set("isambard_title", intent.title || "");
+    url.searchParams.set("isambard_media_type", intent.media_type || "movie");
+    if (intent.year) {
+      url.searchParams.set("isambard_year", intent.year);
+    }
+    if (intent.season) {
+      url.searchParams.set("isambard_season", intent.season);
+    }
+    if (intent.episode) {
+      url.searchParams.set("isambard_episode", intent.episode);
+    }
+    if (intent.poster_url) {
+      url.searchParams.set("isambard_poster_url", intent.poster_url);
+    }
+    if (intent.backdrop_url) {
+      url.searchParams.set("isambard_backdrop_url", intent.backdrop_url);
+    }
+    return url.toString();
+  }
+
+  function notifyAutoIntent(intent) {
+    chrome.runtime.sendMessage({ type: "autoIntent", intent }, () => void chrome.runtime.lastError);
+  }
+
+  function runYflixSearchAutoFind(intent) {
+    const candidates = yflixResultCandidates()
+      .map((candidate) => ({ ...candidate, score: scoreYflixCandidate(candidate, intent) }))
+      .sort((a, b) => b.score - a.score);
+    const best = candidates[0];
+    if (!best || best.score < 30) {
+      return false;
+    }
+    notifyAutoIntent(intent);
+    location.href = buildYflixWatchUrl(best.href, intent);
+    return true;
+  }
+
+  function clickYflixPlayback() {
+    const selectors = [".goto-play", "#player .player-btn", ".player-main.playable", "video"];
+    for (const selector of selectors) {
+      const node = document.querySelector(selector);
+      if (!node) {
+        continue;
+      }
+      node.scrollIntoView?.({ block: "center" });
+      node.click?.();
+    }
+  }
+
+  function runYflixWatchAutoFind(intent) {
+    notifyAutoIntent(intent);
+    const desiredEpisode = intent.media_type === "tv"
+      ? `ep=${intent.season || "1"},${intent.episode || "1"}`
+      : "ep=1";
+    if (!location.hash.includes(desiredEpisode)) {
+      const episodeLink = Array.from(document.querySelectorAll("#filmEps a[href*='#ep=']"))
+        .find((anchor) => String(anchor.href || "").includes(`#${desiredEpisode}`));
+      if (episodeLink?.href) {
+        location.href = buildYflixWatchUrl(episodeLink.href, intent);
+        return true;
+      }
+      location.hash = desiredEpisode;
+    }
+    setTimeout(clickYflixPlayback, 400);
+    setTimeout(clickYflixPlayback, 1600);
+    setTimeout(clickYflixPlayback, 3600);
+    return true;
+  }
+
+  function runYflixAutoFind() {
+    const intent = yflixAutoIntentFromUrl();
+    if (!intent || yflixAutoStarted || yflixAutoAttempts > 12) {
+      return;
+    }
+    yflixAutoStarted = true;
+    yflixAutoAttempts += 1;
+    setTimeout(() => {
+      let handled = false;
+      if (location.pathname.startsWith("/browser")) {
+        handled = runYflixSearchAutoFind(intent);
+      } else if (location.pathname.startsWith("/watch/")) {
+        handled = runYflixWatchAutoFind(intent);
+      }
+      if (!handled && location.pathname.startsWith("/browser")) {
+        yflixAutoStarted = false;
+      }
+    }, 700);
+  }
+
   function publishState() {
     chrome.runtime.sendMessage({
       type: "pageState",
@@ -285,6 +458,7 @@
       return;
     }
     publishState();
+    runYflixAutoFind();
   }
 
   function install() {

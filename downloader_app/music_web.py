@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from .music_manager import MusicManager
 from .music_models import (
@@ -26,7 +26,10 @@ def install_music(app: FastAPI, music_manager: MusicManager) -> None:
 
     @app.post("/api/music/metadata/fetch")
     async def fetch_music_metadata(payload: MusicMetadataFetchRequest) -> dict[str, object]:
-        summary = await music_manager.fetch_metadata(payload.url)
+        try:
+            summary = await music_manager.fetch_metadata(payload.url)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         return summary.model_dump()
 
     @app.get("/api/music/history/fetch")
@@ -57,7 +60,10 @@ def install_music(app: FastAPI, music_manager: MusicManager) -> None:
 
     @app.post("/api/music/queue/start")
     async def start_music_queue(payload: MusicQueueStartRequest) -> dict[str, object]:
-        return await music_manager.start_queue_item(payload.item_id)
+        try:
+            return await music_manager.start_queue_item(payload.item_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.delete("/api/music/queue")
     async def clear_music_queue() -> dict[str, bool]:
