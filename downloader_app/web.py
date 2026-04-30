@@ -5100,7 +5100,7 @@ INDEX_HTML = """
       return `
         <div class="media-detail-list">
           ${seasons.map((season, index) => `
-            <details class="media-detail-season">
+            <details class="media-detail-season" data-season-key="${escapeHtml(String(season.season_number || index + 1))}">
               <summary class="media-detail-row">
                 <div class="media-detail-row-main">
                   <svg class="media-detail-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
@@ -5165,6 +5165,19 @@ INDEX_HTML = """
       `;
     }
 
+    function captureOpenSeasonKeys(scope) {
+      return new Set(Array.from(scope?.querySelectorAll(".media-detail-season[open][data-season-key]") || []).map((season) => season.dataset.seasonKey));
+    }
+
+    function restoreOpenSeasonKeys(scope, openKeys) {
+      if (!openKeys?.size) return;
+      scope?.querySelectorAll(".media-detail-season[data-season-key]").forEach((season) => {
+        if (openKeys.has(season.dataset.seasonKey)) {
+          season.open = true;
+        }
+      });
+    }
+
     function bindSeasonToggleArrows(scope) {
       scope.querySelectorAll(".media-detail-season").forEach((season) => {
         const arrow = season.querySelector(".media-detail-arrow");
@@ -5201,7 +5214,7 @@ INDEX_HTML = """
         owned || primaryLocalOwned,
         owned?.jellyfin_url || details?.jellyfin_url || localStatuses.primary?.jellyfin_url || jellyfinSearchUrl(item.title || "")
       );
-      meta.innerHTML = `
+      const metaHtml = `
         <div class="media-modal-meta">
           <div class="library-highlight-meta">
             ${item.media_type ? `<span class="pill">${escapeHtml(item.media_type === "tv" ? "TV Show" : "Movie")}</span>` : ""}
@@ -5211,14 +5224,24 @@ INDEX_HTML = """
           <div class="media-modal-actions">${primaryAction}</div>
         </div>
       `;
-      if (isTv) {
-        actions.innerHTML = renderTvDetailActions(item, details, owned, localStatuses);
-        bindSeasonToggleArrows(actions);
-      } else {
-        actions.innerHTML = "";
+      if (meta.innerHTML !== metaHtml) {
+        meta.innerHTML = metaHtml;
+        bindMediaActions(meta);
       }
-      bindMediaActions(actions);
-      bindMediaActions(meta);
+      if (isTv) {
+        const openKeys = captureOpenSeasonKeys(actions);
+        const actionsHtml = renderTvDetailActions(item, details, owned, localStatuses);
+        if (actions.innerHTML !== actionsHtml) {
+          actions.innerHTML = actionsHtml;
+          restoreOpenSeasonKeys(actions, openKeys);
+          bindSeasonToggleArrows(actions);
+          bindMediaActions(actions);
+        }
+      } else {
+        if (actions.innerHTML) {
+          actions.innerHTML = "";
+        }
+      }
     }
 
     async function openMediaModal(item) {
