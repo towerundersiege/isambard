@@ -15,7 +15,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi import HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -128,8 +128,23 @@ def build_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    def initial_discover_state() -> dict:
+        try:
+            return media_catalog.discover("")
+        except RuntimeError as exc:
+            LOGGER.info("initial discover preload unavailable: %s", exc)
+            return {"configured": media_catalog.summary().get("tmdb", {}).get("configured", False), "query": "", "sections": [], "source": "tmdb"}
+
+    def script_json(payload: dict) -> str:
+        return json.dumps(payload).replace("<", "\\u003c")
+
     def render_page(active_page: str, media_view: str = "discover") -> str:
-        normalized_media_view = media_view if media_view in {"discover", "library", "download"} else "discover"
+        normalized_media_view = media_view if media_view in {"discover", "search", "download"} else "discover"
+        initial_media_state = (
+            initial_discover_state()
+            if active_page in {"library", "downloads"}
+            else {"configured": media_catalog.summary().get("tmdb", {}).get("configured", False), "query": "", "sections": [], "source": "tmdb"}
+        )
         browser_port = os.environ.get("ISAMBARD_BROWSER_PORT", "8766")
         browser_url = _build_browser_embed_url(
             os.environ.get("BROWSER_URL", f"http://localhost:{browser_port}"),
@@ -154,6 +169,7 @@ def build_app(
             .replace("__MUSIC_PAGE_CLASS__", "page is-active" if active_page == "music" else "page")
             .replace("__SETTINGS_PAGE_CLASS__", "page is-active" if active_page == "settings" else "page")
             .replace("__INITIAL_MEDIA_VIEW__", normalized_media_view)
+            .replace("__INITIAL_DISCOVER_STATE__", script_json(initial_media_state))
         )
 
     @app.get("/", include_in_schema=False)
@@ -172,9 +188,9 @@ def build_app(
     def movies_tv_discover_page() -> str:
         return render_page("library", "discover")
 
-    @app.get("/movies-tv/library", response_class=HTMLResponse)
-    def movies_tv_library_page() -> str:
-        return render_page("library", "library")
+    @app.get("/movies-tv/search", response_class=HTMLResponse)
+    def movies_tv_search_page() -> str:
+        return render_page("library", "search")
 
     @app.get("/movies-tv/download", response_class=HTMLResponse)
     def movies_tv_download_page() -> str:
@@ -350,13 +366,6 @@ def build_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    @app.get("/api/media/library")
-    def media_library(query: str = "") -> dict:
-        try:
-            return media_catalog.library(query)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-
     @app.get("/api/media/details")
     def media_details(provider: str, provider_id: str, media_type: str = "movie") -> dict:
         try:
@@ -364,25 +373,11 @@ def build_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    @app.get("/api/media/jellyfin/image/{item_id}/{image_type}")
-    def media_jellyfin_image(item_id: str, image_type: str, max_width: int | None = None) -> Response:
-        try:
-            payload, content_type = media_catalog.stream_jellyfin_image(item_id, image_type, max_width=max_width)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        return Response(content=payload, media_type=content_type)
-
     @app.post("/api/media/local-status")
     def media_local_status(request: MediaLocalStatusRequest) -> dict:
         status = _local_media_status(download_manager.downloads_dir, request)
         if status.get("exists"):
-            status["jellyfin_url"] = media_catalog.jellyfin_url_for(
-                request.title,
-                year=request.year,
-                media_type=request.media_type,
-                season=request.season,
-                episode=request.episode,
-            )
+            status["jellyfin_url"] = media_catalog.jellyfin_search_url(request.title)
         return status
 
     @app.post("/api/media/auto-find")
@@ -2303,8 +2298,9 @@ INDEX_HTML = """
     .media-grid {
       padding: 18px;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(160px, 180px));
       gap: 14px;
+      justify-content: start;
     }
     .media-card {
       border-radius: 20px;
@@ -2403,11 +2399,6 @@ INDEX_HTML = """
       stroke-width: 1.9;
       stroke-linecap: round;
       stroke-linejoin: round;
-    }
-    .media-card-icon-btn.is-owned {
-      color: #9bf2bb;
-      border-color: rgba(34,197,94,0.24);
-      background: rgba(34,197,94,0.12);
     }
     .media-card-btn,
     .media-card-link {
@@ -2511,6 +2502,9 @@ INDEX_HTML = """
       gap: 6px;
       pointer-events: auto;
     }
+    .auto-download-toast.has-link {
+      cursor: pointer;
+    }
     .auto-download-progress {
       position: absolute;
       left: 0;
@@ -2526,6 +2520,11 @@ INDEX_HTML = """
     @keyframes autoDownloadToastProgress {
       from { transform: scaleX(1); }
       to { transform: scaleX(0); }
+    }
+    .download-media-card.is-highlighted,
+    .completed-list-item.is-highlighted {
+      border-color: rgba(29, 161, 255, 0.62);
+      box-shadow: 0 0 0 1px rgba(29, 161, 255, 0.34), 0 24px 70px rgba(29, 161, 255, 0.18);
     }
     .auto-download-close {
       position: absolute;
@@ -2656,6 +2655,15 @@ INDEX_HTML = """
       cursor: pointer;
       text-decoration: none;
     }
+    .media-modal-action-icon.is-task-status {
+      width: auto;
+      min-width: 96px;
+      padding: 0 13px;
+      grid-auto-flow: column;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 800;
+    }
     .media-modal-action-icon svg {
       width: 20px;
       height: 20px;
@@ -2664,11 +2672,6 @@ INDEX_HTML = """
       stroke-width: 1.9;
       stroke-linecap: round;
       stroke-linejoin: round;
-    }
-    .media-modal-action-icon.is-owned {
-      color: #9bf2bb;
-      border-color: rgba(34,197,94,0.24);
-      background: rgba(34,197,94,0.12);
     }
     .media-modal-action-icon.is-owned .jellyfin-dashboard-icon {
       width: 22px;
@@ -3437,11 +3440,11 @@ INDEX_HTML = """
           <div>
             <p class="eyebrow">Movies &amp; TV</p>
             <h2 class="page-title">Movies &amp; TV</h2>
-            <p class="page-copy">Discover new releases, browse your Jellyfin library, and drive YFlix from one place.</p>
+            <p class="page-copy">Discover new releases, queue downloads, and drive YFlix from one place.</p>
           </div>
           <div class="page-header-actions">
             <button class="page-action-btn is-active" type="button" data-media-view="discover">Discover</button>
-            <button class="page-action-btn" type="button" data-media-view="library">My Library</button>
+            <button class="page-action-btn" type="button" data-media-view="search">Search</button>
             <button class="page-action-btn" type="button" data-media-view="download">Download</button>
           </div>
         </div>
@@ -3824,7 +3827,7 @@ INDEX_HTML = """
               <h2 class="panel-title">Movies &amp; TV</h2>
             </div>
           </header>
-          <div class="settings-summary" id="jellyfin-settings-summary">Jellyfin integration not configured.</div>
+          <div class="settings-summary" id="jellyfin-settings-summary">Jellyfin link not configured.</div>
           <div class="settings-summary" id="tmdb-settings-summary">TMDb integration not configured.</div>
         </section>
         <section class="panel settings-card empty-card">
@@ -3879,6 +3882,8 @@ INDEX_HTML = """
     const AUTO_DOWNLOAD_REQUESTS_KEY = "isambard.autoDownloadRequests";
     const AUTO_DOWNLOAD_TOASTS_KEY = "isambard.autoDownloadToasts";
     const AUTO_DOWNLOAD_TOAST_DURATION = 5000;
+    window.__discoverState = __INITIAL_DISCOVER_STATE__;
+    window.__mediaLoaded = !!(window.__discoverState?.sections || []).length;
 
     function localBrowserEmbedUrl(value) {
       try {
@@ -4137,6 +4142,34 @@ INDEX_HTML = """
         ...(window.__taskState?.queued || []),
         ...(window.__taskState?.completed || [])
       ];
+    }
+
+    function downloadsTaskUrl(taskId) {
+      const id = String(taskId || "").trim();
+      return id ? `/downloads?task=${encodeURIComponent(id)}` : "/downloads";
+    }
+
+    function highlightedTaskIdFromLocation() {
+      if (window.location.pathname !== "/downloads") return "";
+      return new URLSearchParams(window.location.search).get("task") || "";
+    }
+
+    function taskStatusLabel(task) {
+      const status = String(task?.status || "").toLowerCase();
+      if (status === "running") return `Downloading ${Math.round(task.progress || 0)}%`;
+      if (status === "queued") return "Queued";
+      if (status === "paused") return "Paused";
+      if (status === "completed") return "Completed";
+      if (status === "failed") return "Failed";
+      if (status === "stopped") return "Stopped";
+      return "Download";
+    }
+
+    function activeMediaTaskForPayload(payload) {
+      return allTasks().find((task) => {
+        const status = String(task?.status || "").toLowerCase();
+        return ["queued", "running", "paused"].includes(status) && taskMatchesAutoFind(task, payload);
+      }) || null;
     }
 
     function taskSourceLabel(task) {
@@ -4619,7 +4652,7 @@ INDEX_HTML = """
       const finished = task.finished_at ? formatRelativeTime(task.finished_at) : "Unknown time";
       const logs = task.output || task.error || "No logs available.";
       const artwork = taskArtwork(task);
-      const jellyfinUrl = artwork?.jellyfin_url || (window.__systemSummary?.jellyfin?.configured ? window.__systemSummary.jellyfin.url : "");
+      const jellyfinUrl = artwork?.jellyfin_url || jellyfinSearchUrl(task.series_name || task.title || "");
       const status = task.status || "completed";
       const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
       return `
@@ -4676,6 +4709,21 @@ INDEX_HTML = """
           }
         });
       });
+    }
+
+    function applyHighlightedDownloadTask() {
+      const taskId = highlightedTaskIdFromLocation();
+      document.querySelectorAll("[data-task-id].is-highlighted").forEach((node) => {
+        node.classList.remove("is-highlighted");
+      });
+      if (!taskId) return;
+      const target = document.querySelector(`[data-task-id="${CSS.escape(taskId)}"]`);
+      if (!target) return;
+      target.classList.add("is-highlighted");
+      if (!window.__lastHighlightedTaskScroll || window.__lastHighlightedTaskScroll !== taskId) {
+        window.__lastHighlightedTaskScroll = taskId;
+        target.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
     }
 
     function renderStats(groups) {
@@ -4763,6 +4811,8 @@ INDEX_HTML = """
 
       renderStats(groups);
       renderNetworkSparkline();
+      applyHighlightedDownloadTask();
+      renderOpenMediaModalActions();
     }
 
     function notifyTaskStatusChanges() {
@@ -4774,8 +4824,11 @@ INDEX_HTML = """
         next[task.id] = status;
         if (!previous) return;
         const oldStatus = previous[task.id];
-        if (oldStatus && oldStatus !== status && status === "completed") {
-          showAutoDownloadToast("Download complete", cleanMediaTitle(task.title || "Download finished"));
+        if (status === "completed" && oldStatus !== "completed") {
+          showAutoDownloadToast("Download complete", cleanMediaTitle(task.title || "Download finished"), {
+            id: `download-complete-${task.id}`,
+            href: downloadsTaskUrl(task.id),
+          });
         }
       });
       window.__knownTaskStatuses = next;
@@ -4798,8 +4851,7 @@ INDEX_HTML = """
 
     function setMediaArtworkMap() {
       const artwork = {};
-      const libraryMatches = {};
-      const states = [window.__discoverState, window.__libraryState];
+      const states = [window.__discoverState, window.__searchState];
       states.forEach((state) => {
         const sections = state?.sections || [];
         sections.forEach((section) => {
@@ -4814,9 +4866,6 @@ INDEX_HTML = """
             if (key && item.poster_url && !artwork[key]) {
               artwork[key] = item;
             }
-            if (state === window.__libraryState && key && !libraryMatches[key]) {
-              libraryMatches[key] = item;
-            }
           });
         });
         (state?.items || []).forEach((item) => {
@@ -4827,31 +4876,29 @@ INDEX_HTML = """
               artwork[itemKey] = item;
             }
           });
-          if (state === window.__libraryState && key && !libraryMatches[key]) {
-            libraryMatches[key] = item;
-          }
         });
       });
       window.__mediaArtworkByTitle = artwork;
-      window.__libraryMediaByTitle = libraryMatches;
     }
 
     function mediaPathForView(view) {
-      if (view === "library") return "/movies-tv/library";
       if (view === "download") return "/movies-tv/download";
+      if (view === "search") return "/movies-tv/search";
       return "/movies-tv/discover";
     }
 
-    function mediaOwnedItem(item) {
-      const key = normalizeArtworkKey(item?.title || "");
-      return key ? (window.__libraryMediaByTitle || {})[key] || null : null;
+    function normalizeMediaView(name) {
+      if (name === "download" || name === "search") return name;
+      return "discover";
     }
 
-    function jellyfinFallbackUrl(title) {
+    function jellyfinSearchUrl(title) {
       const base = window.__systemSummary?.jellyfin?.url || "";
       if (!base) return "";
       const cleanBase = base.endsWith("/") ? base.slice(0, -1) : base;
-      return `${cleanBase}/web/`;
+      const query = String(title || "").trim();
+      if (!query) return `${cleanBase}/web/`;
+      return `${cleanBase}/web/#/search.html?query=${encodeURIComponent(query)}`;
     }
 
     async function fetchLocalMediaStatuses(requests) {
@@ -4892,7 +4939,7 @@ INDEX_HTML = """
 
     function switchMediaView(name, options = {}) {
       const { updateHistory = true, historyMode = "replace" } = options;
-      window.__mediaView = name === "library" ? "library" : name === "download" ? "download" : "discover";
+      window.__mediaView = normalizeMediaView(name);
       document.querySelectorAll("[data-media-view]").forEach((button) => {
         button.classList.toggle("is-active", button.dataset.mediaView === window.__mediaView);
       });
@@ -4918,16 +4965,21 @@ INDEX_HTML = """
     function renderMediaHighlight() {
       const root = document.getElementById("library-highlight");
       if (!root) return;
-      const state = currentMediaView() === "library" ? window.__libraryState : window.__discoverState;
-      const query = (state?.query || "").trim();
-      root.parentElement?.style.setProperty("display", query ? "none" : "");
-      const highlightItems = currentMediaView() === "discover" ? heroCarouselItems() : (state?.sections || []).flatMap((section) => section.items || []).slice(0, 6);
+      if (currentMediaView() !== "discover") {
+        root.parentElement?.style.setProperty("display", "none");
+        root.innerHTML = "";
+        root.style.backgroundImage = "";
+        return;
+      }
+      const state = window.__discoverState;
+      root.parentElement?.style.setProperty("display", "");
+      const highlightItems = heroCarouselItems();
       const item = highlightItems[Math.abs(window.__heroCarouselIndex || 0) % Math.max(highlightItems.length, 1)];
       if (!item) {
         root.innerHTML = `
           <div class="library-highlight-label">Featured</div>
           <h3 class="library-highlight-title">No media loaded</h3>
-          <p class="library-highlight-copy">Connect Mullvad and configure Jellyfin or TMDb to populate this page.</p>
+          <p class="library-highlight-copy">Connect Mullvad and configure TMDb to populate this page.</p>
         `;
         root.style.backgroundImage = "";
         return;
@@ -4941,7 +4993,7 @@ INDEX_HTML = """
         <div class="library-highlight-stage" id="library-highlight-stage" data-media-modal="${escapeHtml(modalPayload)}">
           <div class="library-highlight-copy-group">
             <h3 class="library-highlight-title">${escapeHtml(item.title || "Untitled")}</h3>
-            <p class="library-highlight-copy">${escapeHtml(item.overview || "Poster-backed media discovery and library handoff live here.")}</p>
+            <p class="library-highlight-copy">${escapeHtml(item.overview || "Poster-backed media discovery and download handoff live here.")}</p>
           </div>
           <div class="library-highlight-meta">
             ${item.year ? `<span class="pill">${escapeHtml(item.year)}</span>` : ""}
@@ -5006,10 +5058,38 @@ INDEX_HTML = """
     }
 
     function renderMediaModalActionButton(payload, owned, jellyfinUrl) {
+      const task = activeMediaTaskForPayload(payload);
+      if (task) {
+        return `<a class="media-modal-action-icon is-task-status" href="${escapeHtml(downloadsTaskUrl(task.id))}" title="Open download">${downloadIconSvg()}<span>${escapeHtml(taskStatusLabel(task))}</span></a>`;
+      }
       if (owned && jellyfinUrl) {
         return `<a class="media-modal-action-icon is-owned" href="${escapeHtml(jellyfinUrl)}" target="_blank" rel="noreferrer" title="Open in Jellyfin">${jellyfinIconSvg()}</a>`;
       }
       return `<button class="media-modal-action-icon" type="button" data-media-autofind="${escapeHtml(encodeURIComponent(JSON.stringify(payload)))}" title="Download">${downloadIconSvg()}</button>`;
+    }
+
+    function episodeStatusKey(seasonNumber, episodeNumber) {
+      return `episode:${seasonNumber}:${episodeNumber}`;
+    }
+
+    function episodeIsDownloaded(season, episode, localStatuses = {}, fallbackSeasonNumber = 1) {
+      const seasonNumber = episode.season_number || season.season_number || fallbackSeasonNumber;
+      const episodeNumber = episode.episode_number || 1;
+      return !!localStatuses[episodeStatusKey(seasonNumber, episodeNumber)]?.exists;
+    }
+
+    function downloadedEpisodeCount(season, localStatuses = {}, fallbackSeasonNumber = 1) {
+      return (season.episodes || []).filter((episode) => episodeIsDownloaded(season, episode, localStatuses, fallbackSeasonNumber)).length;
+    }
+
+    function seasonIsFullyDownloaded(season, localStatuses = {}, fallbackSeasonNumber = 1) {
+      const episodes = season.episodes || [];
+      return episodes.length > 0 && episodes.every((episode) => episodeIsDownloaded(season, episode, localStatuses, fallbackSeasonNumber));
+    }
+
+    function showIsFullyDownloaded(details, localStatuses = {}) {
+      const seasonsWithEpisodes = (details?.seasons || []).filter((season) => (season.episodes || []).length > 0);
+      return seasonsWithEpisodes.length > 0 && seasonsWithEpisodes.every((season, index) => seasonIsFullyDownloaded(season, localStatuses, season.season_number || index + 1));
     }
 
     function renderTvDetailActions(item, details, owned, localStatuses = {}) {
@@ -5027,12 +5107,12 @@ INDEX_HTML = """
                   <div class="media-detail-title">${escapeHtml(`S${String(season.season_number || index + 1).padStart(2, "0")}`)}</div>
                 </div>
                 <div class="media-detail-row-actions">
-                  <span class="media-detail-count">${escapeHtml(`${(season.episodes || []).filter((episode) => owned || episode.owned).length}/${season.episode_count || (season.episodes || []).length || 0}`)}</span>
+                  <span class="media-detail-count">${escapeHtml(`${downloadedEpisodeCount(season, localStatuses, season.season_number || index + 1)}/${season.episode_count || (season.episodes || []).length || 0}`)}</span>
                   ${(() => {
                     const seasonNumber = season.season_number || index + 1;
                     const key = `season:${seasonNumber}`;
-                    const localOwned = !!localStatuses[key]?.exists;
-                    const url = season.jellyfin_url || localStatuses[key]?.jellyfin_url || owned?.jellyfin_url || details?.jellyfin_url || jellyfinFallbackUrl(item.title || season.search_hint || "");
+                    const localOwned = seasonIsFullyDownloaded(season, localStatuses, seasonNumber);
+                    const url = season.jellyfin_url || localStatuses[key]?.jellyfin_url || owned?.jellyfin_url || details?.jellyfin_url || jellyfinSearchUrl(item.title || season.search_hint || "");
                     return renderMediaModalActionButton(
                       {
                         title: item.title || season.search_hint || "",
@@ -5043,7 +5123,7 @@ INDEX_HTML = """
                         poster_url: item.poster_url || "",
                         backdrop_url: item.backdrop_url || "",
                       },
-                      owned || season.owned || localOwned,
+                      localOwned,
                       url
                     );
                   })()}
@@ -5056,11 +5136,11 @@ INDEX_HTML = """
                     <div class="media-detail-row-actions">
                       <span class="media-detail-date">${escapeHtml(episode.air_date || "")}</span>
                       ${(() => {
-                        const seasonNumber = episode.season_number || season.season_number || index + 1;
-                        const episodeNumber = episode.episode_number || 1;
-                        const key = `episode:${seasonNumber}:${episodeNumber}`;
+                    const seasonNumber = episode.season_number || season.season_number || index + 1;
+                    const episodeNumber = episode.episode_number || 1;
+                        const key = episodeStatusKey(seasonNumber, episodeNumber);
                         const localOwned = !!localStatuses[key]?.exists;
-                        const url = episode.jellyfin_url || localStatuses[key]?.jellyfin_url || season.jellyfin_url || owned?.jellyfin_url || details?.jellyfin_url || jellyfinFallbackUrl(item.title || episode.search_hint || "");
+                        const url = episode.jellyfin_url || localStatuses[key]?.jellyfin_url || owned?.jellyfin_url || details?.jellyfin_url || jellyfinSearchUrl(item.title || episode.search_hint || "");
                         return renderMediaModalActionButton(
                           {
                             title: item.title || episode.search_hint || "",
@@ -5071,7 +5151,7 @@ INDEX_HTML = """
                             poster_url: item.poster_url || "",
                             backdrop_url: item.backdrop_url || "",
                           },
-                          owned || episode.owned || localOwned,
+                          localOwned,
                           url
                         );
                       })()}
@@ -5099,6 +5179,48 @@ INDEX_HTML = """
       });
     }
 
+    function renderOpenMediaModalActions() {
+      const meta = document.getElementById("media-modal-meta");
+      const actions = document.getElementById("media-modal-actions");
+      const item = window.__openMediaItem;
+      if (!meta || !actions || !item) return;
+      if (!window.__openMediaDetails || !window.__openMediaLocalStatuses) return;
+      const owned = null;
+      const details = window.__openMediaDetails;
+      const localStatuses = window.__openMediaLocalStatuses;
+      const isTv = (item.media_type || "movie") === "tv";
+      const primaryLocalOwned = isTv ? showIsFullyDownloaded(details, localStatuses) : !!localStatuses.primary?.exists;
+      const primaryAction = renderMediaModalActionButton(
+        {
+          title: item.title || "",
+          year: item.year || "",
+          media_type: item.media_type || "movie",
+          poster_url: item.poster_url || "",
+          backdrop_url: item.backdrop_url || "",
+        },
+        owned || primaryLocalOwned,
+        owned?.jellyfin_url || details?.jellyfin_url || localStatuses.primary?.jellyfin_url || jellyfinSearchUrl(item.title || "")
+      );
+      meta.innerHTML = `
+        <div class="media-modal-meta">
+          <div class="library-highlight-meta">
+            ${item.media_type ? `<span class="pill">${escapeHtml(item.media_type === "tv" ? "TV Show" : "Movie")}</span>` : ""}
+            ${item.year ? `<span class="pill">${escapeHtml(item.year)}</span>` : ""}
+            ${item.rating ? `<span class="pill">★ ${escapeHtml(Number(item.rating || 0).toFixed(1))}</span>` : ""}
+          </div>
+          <div class="media-modal-actions">${primaryAction}</div>
+        </div>
+      `;
+      if (isTv) {
+        actions.innerHTML = renderTvDetailActions(item, details, owned, localStatuses);
+        bindSeasonToggleArrows(actions);
+      } else {
+        actions.innerHTML = "";
+      }
+      bindMediaActions(actions);
+      bindMediaActions(meta);
+    }
+
     async function openMediaModal(item) {
       const modal = document.getElementById("media-modal");
       const hero = document.getElementById("media-modal-hero");
@@ -5108,7 +5230,6 @@ INDEX_HTML = """
       const overview = document.getElementById("media-modal-overview");
       const actions = document.getElementById("media-modal-actions");
       if (!modal || !hero || !poster || !meta || !title || !overview || !actions) return;
-      const owned = mediaOwnedItem(item);
       const backdrop = item.backdrop_url ? `linear-gradient(180deg, rgba(7,16,26,0.08), rgba(7,16,26,0.94)), url("${item.backdrop_url}")` : "";
       hero.style.backgroundImage = backdrop || "";
       poster.innerHTML = item.poster_url ? `<img src="${escapeHtml(item.poster_url)}" alt="${escapeHtml(item.title || "Poster")}">` : "";
@@ -5117,7 +5238,6 @@ INDEX_HTML = """
           ${item.media_type ? `<span class="pill">${escapeHtml(item.media_type === "tv" ? "TV Show" : "Movie")}</span>` : ""}
           ${item.year ? `<span class="pill">${escapeHtml(item.year)}</span>` : ""}
           ${item.rating ? `<span class="pill">★ ${escapeHtml(Number(item.rating || 0).toFixed(1))}</span>` : ""}
-          ${owned ? '<span class="pill">In Jellyfin</span>' : ""}
         </div>
       `;
       title.textContent = item.title || "Untitled";
@@ -5127,6 +5247,8 @@ INDEX_HTML = """
       modal.setAttribute("aria-hidden", "false");
       document.body.style.overflow = "hidden";
       window.__openMediaItem = item;
+      window.__openMediaDetails = null;
+      window.__openMediaLocalStatuses = null;
       let details = { seasons: [] };
       try {
         const detailsResponse = await fetch(`/api/media/details?provider=${encodeURIComponent(item.provider || "tmdb")}&provider_id=${encodeURIComponent(item.provider_id || "")}&media_type=${encodeURIComponent(item.media_type || "movie")}`);
@@ -5176,37 +5298,9 @@ INDEX_HTML = """
       if (window.__openMediaItem?.id !== item.id) {
         return;
       }
-      const primaryLocalOwned = !!localStatuses.primary?.exists;
-      const primaryAction = renderMediaModalActionButton(
-        {
-          title: item.title || "",
-          year: item.year || "",
-          media_type: item.media_type || "movie",
-          poster_url: item.poster_url || "",
-          backdrop_url: item.backdrop_url || "",
-        },
-        owned || primaryLocalOwned,
-        owned?.jellyfin_url || details?.jellyfin_url || localStatuses.primary?.jellyfin_url || jellyfinFallbackUrl(item.title || "")
-      );
-      meta.innerHTML = `
-        <div class="media-modal-meta">
-          <div class="library-highlight-meta">
-            ${item.media_type ? `<span class="pill">${escapeHtml(item.media_type === "tv" ? "TV Show" : "Movie")}</span>` : ""}
-            ${item.year ? `<span class="pill">${escapeHtml(item.year)}</span>` : ""}
-            ${item.rating ? `<span class="pill">★ ${escapeHtml(Number(item.rating || 0).toFixed(1))}</span>` : ""}
-            ${owned ? '<span class="pill">In Jellyfin</span>' : ""}
-          </div>
-          <div class="media-modal-actions">${primaryAction}</div>
-        </div>
-      `;
-      if ((item.media_type || "movie") === "tv") {
-        actions.innerHTML = renderTvDetailActions(item, details, owned, localStatuses);
-        bindSeasonToggleArrows(actions);
-      } else {
-        actions.innerHTML = "";
-      }
-      bindMediaActions(actions);
-      bindMediaActions(meta);
+      window.__openMediaDetails = details;
+      window.__openMediaLocalStatuses = localStatuses;
+      renderOpenMediaModalActions();
     }
 
     function closeMediaModal() {
@@ -5216,6 +5310,8 @@ INDEX_HTML = """
       modal.setAttribute("aria-hidden", "true");
       document.body.style.overflow = "";
       window.__openMediaItem = null;
+      window.__openMediaDetails = null;
+      window.__openMediaLocalStatuses = null;
     }
 
     function readSessionJson(key, fallback) {
@@ -5269,12 +5365,13 @@ INDEX_HTML = """
       const id = options.id || `toast-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const createdAt = Number(options.created_at || Date.now());
       const expiresAt = Number(options.expires_at || createdAt + AUTO_DOWNLOAD_TOAST_DURATION);
+      const href = String(options.href || "");
       if (options.persist !== false) {
-        upsertAutoDownloadToast({ id, title, copy, created_at: createdAt, expires_at: expiresAt });
+        upsertAutoDownloadToast({ id, title, copy, href, created_at: createdAt, expires_at: expiresAt });
       }
       const elapsed = Math.max(0, Date.now() - createdAt);
       const toast = document.createElement("div");
-      toast.className = "auto-download-toast";
+      toast.className = `auto-download-toast${href ? " has-link" : ""}`;
       toast.innerHTML = `
         <button class="auto-download-close" type="button" aria-label="Dismiss">×</button>
         <div class="auto-download-title">${escapeHtml(title || "Auto download")}</div>
@@ -5289,6 +5386,12 @@ INDEX_HTML = """
         toast.remove();
       };
       toast.querySelector(".auto-download-close")?.addEventListener("click", remove);
+      if (href) {
+        toast.addEventListener("click", (event) => {
+          if (event.target.closest(".auto-download-close")) return;
+          window.location.href = href;
+        });
+      }
       timer = setTimeout(remove, Math.max(0, expiresAt - Date.now()));
       return {
         dismiss: remove
@@ -5435,6 +5538,7 @@ INDEX_HTML = """
             const response = await fetch("/api/tasks");
             if (response.ok) {
               window.__taskState = await response.json();
+              notifyTaskStatusChanges();
               renderTasks();
               const match = allTasks().find((task) => !existingIds.has(task.id) && taskMatchesAutoFind(task, payload));
               if (match) {
@@ -5494,8 +5598,10 @@ INDEX_HTML = """
             } catch (_error) {
               // Clipboard is optional; the hint still renders in the side panel.
             }
-            closeMediaModal();
-            await waitForAutoDownloadQueued(payload, existingIds, request);
+            const queuedTask = await waitForAutoDownloadQueued(payload, existingIds, request);
+            if (queuedTask) {
+              renderOpenMediaModalActions();
+            }
           } catch (error) {
             console.error(error);
             appendAutoDownloadLog(request, "Auto download could not start. Check Mullvad and the remote browser.", "failed");
@@ -5511,33 +5617,39 @@ INDEX_HTML = """
       if (!container) return;
       if (currentMediaView() === "download") {
         container.innerHTML = "";
+        renderMediaHighlight();
         return;
       }
-      const state = currentMediaView() === "library" ? window.__libraryState : window.__discoverState;
+      const isSearchView = currentMediaView() === "search";
+      const state = isSearchView ? window.__searchState : window.__discoverState;
+      if (isSearchView && !state) {
+        window.__searchState = { configured: true, query: "", sections: [], source: "tmdb" };
+        renderMediaSections();
+        return;
+      }
       if (!state?.configured && !(state?.sections || []).length) {
-        const sourceLabel = currentMediaView() === "library" ? "Jellyfin" : "TMDb";
-        container.innerHTML = `<section class="library-section"><div class="media-card-empty">${escapeHtml(sourceLabel)} is not configured or not reachable through Mullvad yet.</div></section>`;
+        container.innerHTML = '<section class="library-section"><div class="media-card-empty">TMDb is not configured or not reachable through Mullvad yet.</div></section>';
         renderMediaHighlight();
         return;
       }
       const sections = state.sections || [];
-      const query = (state.query || "").trim();
-      const useGrid = currentMediaView() === "library" && !!query;
-      if (query) {
+      if (isSearchView) {
+        const query = (state?.query || "").trim();
         const mergedItems = sections.flatMap((section) => section.items || []);
         container.innerHTML = `
           <section class="library-section">
             <header class="panel-header premium-header">
               <div>
-                <h3 class="section-title">Results</h3>
+                <h3 class="section-title">${query ? `Results for "${escapeHtml(query)}"` : "Search"}</h3>
               </div>
             </header>
             <div class="media-grid">
-              ${mergedItems.length ? mergedItems.map(mediaCard).join("") : '<div class="media-card-empty">No matching items found.</div>'}
+              ${query ? (mergedItems.length ? mergedItems.map(mediaCard).join("") : '<div class="media-card-empty">No matching items found.</div>') : '<div class="media-card-empty">Search for a movie or TV show.</div>'}
             </div>
           </section>
         `;
         bindMediaActions(container);
+        renderMediaHighlight();
         setMediaArtworkMap();
         renderTasks();
         return;
@@ -5547,10 +5659,9 @@ INDEX_HTML = """
           <header class="panel-header premium-header">
             <div>
               <h3 class="section-title">${escapeHtml(section.title || "Section")}</h3>
-              ${currentMediaView() === "library" ? '<p class="section-copy">Pulled directly from Jellyfin.</p>' : ""}
             </div>
           </header>
-          <div class="${useGrid ? "media-grid" : "media-rail"}">
+          <div class="media-rail">
             ${(section.items || []).length ? (section.items || []).map(mediaCard).join("") : '<div class="media-card-empty">No items in this section.</div>'}
           </div>
         </section>
@@ -5565,14 +5676,19 @@ INDEX_HTML = """
       if (activePageName() !== "library" && !force) {
         return;
       }
-      const query = document.getElementById("media-search-input")?.value?.trim() || "";
-      const search = query ? `?query=${encodeURIComponent(query)}` : "";
-      const [discoverResponse, libraryResponse] = await Promise.all([
-        fetch(`/api/media/discover${search}`),
-        fetch(`/api/media/library${search}`),
-      ]);
-      window.__discoverState = discoverResponse.ok ? await discoverResponse.json() : { configured: false, sections: [] };
-      window.__libraryState = libraryResponse.ok ? await libraryResponse.json() : { configured: false, sections: [] };
+      if (currentMediaView() === "search") {
+        const query = document.getElementById("media-search-input")?.value?.trim() || "";
+        if (!query) {
+          window.__searchState = { configured: true, query: "", sections: [], source: "tmdb" };
+          renderMediaSections();
+          return;
+        }
+        const searchResponse = await fetch(`/api/media/discover?query=${encodeURIComponent(query)}`);
+        window.__searchState = searchResponse.ok ? await searchResponse.json() : { configured: false, query, sections: [] };
+      } else {
+        const discoverResponse = await fetch("/api/media/discover");
+        window.__discoverState = discoverResponse.ok ? await discoverResponse.json() : { configured: false, query: "", sections: [] };
+      }
       renderMediaSections();
     }
 
@@ -6035,8 +6151,8 @@ INDEX_HTML = """
       const tmdbSummary = document.getElementById("tmdb-settings-summary");
       if (jellyfinSummary) {
         jellyfinSummary.textContent = summary.jellyfin?.configured
-          ? `Jellyfin connected at ${summary.jellyfin.url}`
-          : "Set JELLYFIN_URL to surface library handoff links here.";
+          ? `Jellyfin opens at ${summary.jellyfin.url}`
+          : "Set JELLYFIN_URL to show Jellyfin handoff links for completed media.";
       }
       if (tmdbSummary) {
         tmdbSummary.textContent = summary.tmdb?.configured
@@ -6215,8 +6331,9 @@ INDEX_HTML = """
 
     document.querySelectorAll("[data-media-view]").forEach((button) => {
       button.addEventListener("click", async () => {
-        switchMediaView(button.dataset.mediaView || "discover", { updateHistory: true, historyMode: "push" });
-        if (!window.__mediaLoaded) {
+        const nextView = normalizeMediaView(button.dataset.mediaView || "discover");
+        switchMediaView(nextView, { updateHistory: true, historyMode: "push" });
+        if ((nextView === "discover" && !window.__discoverState) || (nextView === "search" && !window.__searchState) || !window.__mediaLoaded) {
           await refreshMediaData(true);
           window.__mediaLoaded = true;
         }
@@ -6225,6 +6342,7 @@ INDEX_HTML = """
 
     document.getElementById("media-search-form")?.addEventListener("submit", async (event) => {
       event.preventDefault();
+      switchMediaView("search", { updateHistory: true, historyMode: "push" });
       await refreshMediaData(true);
       window.__mediaLoaded = true;
     });
@@ -6242,10 +6360,10 @@ INDEX_HTML = """
     });
     window.addEventListener("popstate", () => {
       const path = window.location.pathname;
-      if (path === "/movies-tv/library") {
-        switchMediaView("library", { updateHistory: false });
-      } else if (path === "/movies-tv/download") {
+      if (path === "/movies-tv/download") {
         switchMediaView("download", { updateHistory: false });
+      } else if (path === "/movies-tv/search") {
+        switchMediaView("search", { updateHistory: false });
       } else if (path === "/movies-tv/discover" || path === "/movies-tv") {
         switchMediaView("discover", { updateHistory: false });
       }

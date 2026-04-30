@@ -33,9 +33,9 @@ MUSIC_MANAGER = MusicManager(
 )
 MEDIA_CATALOG = MediaCatalog(
     jellyfin_url=os.environ.get("JELLYFIN_URL", ""),
-    jellyfin_api_key=os.environ.get("JELLYFIN_API_KEY", ""),
     tmdb_api_key=os.environ.get("TMDB_API_KEY", ""),
     require_outbound=MULLVAD_GUARD.assert_connected,
+    cache_dir=DOWNLOADS_DIR / ".media-cache",
 )
 app = build_app(DOWNLOAD_MANAGER, YOUTUBE_MANAGER, MUSIC_MANAGER, MULLVAD_GUARD, MEDIA_CATALOG)
 
