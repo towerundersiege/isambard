@@ -22,11 +22,14 @@ PROGRESS_RE = re.compile(
     r"(?:\s+at\s+(?P<speed>\S+))?(?:\s+ETA\s+(?P<eta>\S+))?"
 )
 LOGGER = logging.getLogger("isambard.downloads")
+DEFAULT_SOCKET_TIMEOUT_SECONDS = "60"
+DEFAULT_RETRY_SLEEP = "fragment:exp=1:20,http:exp=1:20"
+DEFAULT_EXTRACTOR_ARGS = "generic:impersonate"
 
 
 def _read_concurrency(name: str, default: int) -> int:
     try:
-        return max(1, int(os.environ.get(name, str(default))))
+        return min(default, max(1, int(os.environ.get(name, str(default)))))
     except ValueError:
         return default
 
@@ -92,10 +95,10 @@ class DownloadManager:
         self._running_counts: dict[str, int] = {}
         self._outbound_ready = outbound_ready or (lambda: True)
         self._concurrency_limits = {
-            "movie": _read_concurrency("MOVIE_DOWNLOAD_CONCURRENCY", 5),
-            "tv": _read_concurrency("TV_DOWNLOAD_CONCURRENCY", 5),
-            "youtube": _read_concurrency("YOUTUBE_DOWNLOAD_CONCURRENCY", 5),
-            "standard": _read_concurrency("STANDARD_DOWNLOAD_CONCURRENCY", 5),
+            "movie": _read_concurrency("MOVIE_DOWNLOAD_CONCURRENCY", 1),
+            "tv": _read_concurrency("TV_DOWNLOAD_CONCURRENCY", 1),
+            "youtube": _read_concurrency("YOUTUBE_DOWNLOAD_CONCURRENCY", 1),
+            "standard": _read_concurrency("STANDARD_DOWNLOAD_CONCURRENCY", 1),
         }
         self._load_state()
         worker_count = max(1, sum(self._concurrency_limits.values()))
@@ -317,20 +320,32 @@ class DownloadManager:
 
         output_template = Path(task.output_template)
         output_template.parent.mkdir(parents=True, exist_ok=True)
+        socket_timeout = os.environ.get("YT_DLP_SOCKET_TIMEOUT", DEFAULT_SOCKET_TIMEOUT_SECONDS)
+        retry_sleeps = [
+            item.strip()
+            for item in os.environ.get("YT_DLP_RETRY_SLEEP", DEFAULT_RETRY_SLEEP).split(",")
+            if item.strip()
+        ]
+        extractor_args = os.environ.get("YT_DLP_EXTRACTOR_ARGS", DEFAULT_EXTRACTOR_ARGS).strip()
         command = [
             resolved,
             "--newline",
-            "--abort-on-unavailable-fragments",
+            "--socket-timeout",
+            socket_timeout,
             "--fragment-retries",
-            "20",
+            "infinite",
             "--retries",
-            "10",
+            "infinite",
             "--merge-output-format",
             "mp4",
             "-o",
             str(output_template),
             task.url,
         ]
+        for retry_sleep in reversed(retry_sleeps):
+            command[1:1] = ["--retry-sleep", retry_sleep]
+        if extractor_args:
+            command[1:1] = ["--extractor-args", extractor_args]
         if task.source_type == "youtube":
             youtube_args = ["--download-archive", str(self.youtube_archive_file)]
             if self.youtube_cookies_file.exists():

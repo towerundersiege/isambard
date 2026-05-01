@@ -67,6 +67,7 @@ class MusicManager:
         self.db_path = data_dir / "music.db"
         self._queue: list[MusicQueueItem] = []
         self._lock = asyncio.Lock()
+        self._download_lock = asyncio.Lock()
         self._require_outbound = require_outbound or (lambda _context: None)
         self.ensure_db()
 
@@ -231,48 +232,51 @@ class MusicManager:
 
     async def start_queue_item(self, item_id: str) -> dict[str, object]:
         self._require_outbound("Music download")
-        async with self._lock:
-            item = next((candidate for candidate in self._queue if candidate.id == item_id), None)
-            if item is None:
-                raise HTTPException(status_code=404, detail="Queue item not found")
-            item.status = "downloading"
-            item.start_time = int(time.time())
-            item.progress = 0.0
-        for step in range(1, 6):
-            await asyncio.sleep(0.35)
+        async with self._download_lock:
+            async with self._lock:
+                item = next((candidate for candidate in self._queue if candidate.id == item_id), None)
+                if item is None:
+                    raise HTTPException(status_code=404, detail="Queue item not found")
+                if item.status != "queued":
+                    return item.model_dump()
+                item.status = "downloading"
+                item.start_time = int(time.time())
+                item.progress = 0.0
+            for step in range(1, 6):
+                await asyncio.sleep(0.35)
+                async with self._lock:
+                    fresh = next((candidate for candidate in self._queue if candidate.id == item_id), None)
+                    if fresh is None:
+                        raise HTTPException(status_code=404, detail="Queue item not found")
+                    fresh.progress = float(step * 20)
+                    fresh.speed = 1.2 + step * 0.18
             async with self._lock:
                 fresh = next((candidate for candidate in self._queue if candidate.id == item_id), None)
                 if fresh is None:
                     raise HTTPException(status_code=404, detail="Queue item not found")
-                fresh.progress = float(step * 20)
-                fresh.speed = 1.2 + step * 0.18
-        async with self._lock:
-            fresh = next((candidate for candidate in self._queue if candidate.id == item_id), None)
-            if fresh is None:
-                raise HTTPException(status_code=404, detail="Queue item not found")
-            fresh.status = "completed"
-            fresh.end_time = int(time.time())
-            safe_artist = self._safe_segment(fresh.artist_name or "Unknown Artist")
-            safe_track = self._safe_segment(fresh.track_name or "Track")
-            fresh.file_path = str(self.data_dir / "downloads" / f"{safe_artist} - {safe_track}.flac")
-            self._add_download_history(
-                MusicDownloadHistoryItem(
-                    id=uuid.uuid4().hex,
-                    spotify_id=fresh.spotify_id,
-                    title=fresh.track_name,
-                    artists=fresh.artist_name,
-                    album=fresh.album_name,
-                    duration_str="0:00",
-                    cover_url="",
-                    quality="LOSSLESS",
-                    format="FLAC",
-                    path=fresh.file_path,
-                    source="isambard-music",
-                    timestamp=int(time.time()),
+                fresh.status = "completed"
+                fresh.end_time = int(time.time())
+                safe_artist = self._safe_segment(fresh.artist_name or "Unknown Artist")
+                safe_track = self._safe_segment(fresh.track_name or "Track")
+                fresh.file_path = str(self.data_dir / "downloads" / f"{safe_artist} - {safe_track}.flac")
+                self._add_download_history(
+                    MusicDownloadHistoryItem(
+                        id=uuid.uuid4().hex,
+                        spotify_id=fresh.spotify_id,
+                        title=fresh.track_name,
+                        artists=fresh.artist_name,
+                        album=fresh.album_name,
+                        duration_str="0:00",
+                        cover_url="",
+                        quality="LOSSLESS",
+                        format="FLAC",
+                        path=fresh.file_path,
+                        source="isambard-music",
+                        timestamp=int(time.time()),
+                    )
                 )
-            )
-            LOGGER.info("music queue completed id=%s track=%s", fresh.id, fresh.track_name)
-            return fresh.model_dump()
+                LOGGER.info("music queue completed id=%s track=%s", fresh.id, fresh.track_name)
+                return fresh.model_dump()
 
     def _add_fetch_history(self, item: MusicFetchHistoryItem) -> None:
         with self._conn() as conn:

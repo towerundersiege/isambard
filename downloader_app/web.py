@@ -34,6 +34,7 @@ BROWSER_SITES = {
     "yflix": "https://yflix.to/",
     "dashflix": "https://dashflix.top/",
 }
+YFLIX_AUTO_COMMAND_INTERVAL_SECONDS = 25
 
 
 class QueueRequest(BaseModel):
@@ -113,6 +114,8 @@ def build_app(
     }
     app.state.browser_command_sequence = int(time.time() * 1000)
     app.state.browser_command = {"id": app.state.browser_command_sequence, "action": "", "value": ""}
+    app.state.browser_command_queue = []
+    app.state.browser_command_next_available_at = 0.0
 
     def next_browser_command_id() -> int:
         app.state.browser_command_sequence = max(
@@ -121,6 +124,37 @@ def build_app(
             int(time.time() * 1000),
         ) + 1
         return app.state.browser_command_sequence
+
+    def is_rate_limited_browser_command(command: dict) -> bool:
+        value = str(command.get("value") or "")
+        return (
+            command.get("action") == "navigate"
+            and value.startswith(BROWSER_SITES["yflix"])
+            and "isambard_title=" in value
+        )
+
+    def activate_browser_command(command: dict) -> None:
+        app.state.browser_command = command
+        if is_rate_limited_browser_command(command):
+            app.state.browser_command_next_available_at = time.monotonic() + YFLIX_AUTO_COMMAND_INTERVAL_SECONDS
+
+    def queue_browser_command(action: str, value: str = "") -> dict:
+        current_id = next_browser_command_id()
+        command = {"id": current_id, "action": action, "value": value}
+        delay_remaining = app.state.browser_command_next_available_at - time.monotonic()
+        if app.state.browser_command.get("action") or delay_remaining > 0:
+            app.state.browser_command_queue.append(command)
+            LOGGER.info(
+                "queued browser command id=%s action=%s pending=%s delay_remaining=%.1fs",
+                current_id,
+                action,
+                len(app.state.browser_command_queue),
+                max(0.0, delay_remaining),
+            )
+        else:
+            activate_browser_command(command)
+            LOGGER.info("activated browser command id=%s action=%s", current_id, action)
+        return command
 
     def require_mullvad(context: str) -> None:
         try:
@@ -291,7 +325,25 @@ def build_app(
 
     @app.get("/api/browser/command")
     def browser_command() -> dict:
+        if not app.state.browser_command.get("action") and app.state.browser_command_queue:
+            delay_remaining = app.state.browser_command_next_available_at - time.monotonic()
+            if delay_remaining > 0:
+                return app.state.browser_command
+            activate_browser_command(app.state.browser_command_queue.pop(0))
+            LOGGER.info(
+                "activated queued browser command id=%s action=%s remaining=%s",
+                app.state.browser_command.get("id", 0),
+                app.state.browser_command.get("action", ""),
+                len(app.state.browser_command_queue),
+            )
         return app.state.browser_command
+
+    @app.post("/api/browser/command/ack")
+    def acknowledge_browser_command(request: BrowserCommandRequest) -> dict:
+        if int(app.state.browser_command.get("id", 0)) == request.command_id:
+            app.state.browser_command = {"id": request.command_id, "action": "", "value": ""}
+            LOGGER.info("acknowledged browser command id=%s", request.command_id)
+        return {"ok": True}
 
     @app.post("/api/browser/command/{action}")
     def issue_browser_command(action: str) -> dict:
@@ -299,10 +351,9 @@ def build_app(
         if action not in {"back", "forward", "reload"}:
             LOGGER.warning("unsupported browser command action=%s", action)
             return {"ok": False, "error": "unsupported action"}
-        current_id = next_browser_command_id()
-        app.state.browser_command = {"id": current_id, "action": action, "value": ""}
-        LOGGER.info("issued browser command id=%s action=%s", current_id, action)
-        return {"ok": True, "id": current_id, "action": action}
+        command = queue_browser_command(action)
+        LOGGER.info("issued browser command id=%s action=%s", command["id"], action)
+        return {"ok": True, "id": command["id"], "action": action}
 
     @app.post("/api/browser/navigate")
     def navigate_browser(request: BrowserNavigateRequest) -> dict:
@@ -311,17 +362,9 @@ def build_app(
         if not target:
             LOGGER.warning("unsupported browser site site=%s", request.site)
             return {"ok": False, "error": "unsupported site"}
-        current_id = next_browser_command_id()
-        app.state.browser_command = {"id": current_id, "action": "navigate", "value": target}
-        LOGGER.info("issued browser navigate id=%s site=%s target=%s", current_id, request.site, target)
-        return {"ok": True, "id": current_id, "action": "navigate", "value": target}
-
-    @app.post("/api/browser/command/ack")
-    def acknowledge_browser_command(request: BrowserCommandRequest) -> dict:
-        if int(app.state.browser_command.get("id", 0)) == request.command_id:
-            app.state.browser_command = {"id": request.command_id, "action": "", "value": ""}
-            LOGGER.info("acknowledged browser command id=%s", request.command_id)
-        return {"ok": True}
+        command = queue_browser_command("navigate", target)
+        LOGGER.info("issued browser navigate id=%s site=%s target=%s", command["id"], request.site, target)
+        return {"ok": True, "id": command["id"], "action": "navigate", "value": target}
 
     @app.get("/extension.zip")
     def extension_zip() -> StreamingResponse:
@@ -393,22 +436,17 @@ def build_app(
             poster_url=request.poster_url,
             backdrop_url=request.backdrop_url,
         )
-        current_id = next_browser_command_id()
-        app.state.browser_command = {
-            "id": current_id,
-            "action": "navigate",
-            "value": payload["target_url"],
-        }
+        command = queue_browser_command("navigate", payload["target_url"])
         LOGGER.info(
             "issued browser auto-find id=%s title=%s site=%s target=%s",
-            current_id,
+            command["id"],
             request.title,
             request.site,
             payload["target_url"],
         )
         return {
             **payload,
-            "browser_command_id": current_id,
+            "browser_command_id": command["id"],
         }
 
     @app.post("/api/youtube/lookup")
@@ -2673,6 +2711,19 @@ INDEX_HTML = """
       stroke-linecap: round;
       stroke-linejoin: round;
     }
+    .media-modal-action-icon.is-busy {
+      cursor: progress;
+    }
+    .media-modal-action-icon:disabled {
+      opacity: 0.82;
+      cursor: progress;
+    }
+    .media-modal-action-icon .spinner-icon {
+      animation: modal-spinner 0.8s linear infinite;
+    }
+    @keyframes modal-spinner {
+      to { transform: rotate(360deg); }
+    }
     .media-modal-action-icon.is-owned .jellyfin-dashboard-icon {
       width: 22px;
       height: 22px;
@@ -4165,10 +4216,26 @@ INDEX_HTML = """
       return "Download";
     }
 
+    function autoFindItemsForPayload(payload) {
+      const batchItems = Array.isArray(payload?.batch_items) ? payload.batch_items.filter(Boolean) : [];
+      return batchItems.length ? batchItems : [payload];
+    }
+
     function activeMediaTaskForPayload(payload) {
+      const payloads = autoFindItemsForPayload(payload);
       return allTasks().find((task) => {
         const status = String(task?.status || "").toLowerCase();
-        return ["queued", "running", "paused"].includes(status) && taskMatchesAutoFind(task, payload);
+        return ["queued", "running", "paused"].includes(status) && payloads.some((item) => taskMatchesAutoFind(task, item));
+      }) || null;
+    }
+
+    function activeAutoDownloadRequestForPayload(payload) {
+      const payloads = autoFindItemsForPayload(payload);
+      return restoreAutoDownloadRequests().find((request) => {
+        const status = String(request?.status || "").toLowerCase();
+        if (["completed", "failed", "stopped"].includes(status)) return false;
+        const requestTask = { ...(request.payload || {}), status: "queued" };
+        return payloads.some((item) => taskMatchesAutoFind(requestTask, item));
       }) || null;
     }
 
@@ -5026,6 +5093,10 @@ INDEX_HTML = """
       return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11"/><path d="M8 11l4 4 4-4"/><path d="M5 19h14"/></svg>';
     }
 
+    function spinnerIconSvg() {
+      return '<svg class="spinner-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.2-8.6"/></svg>';
+    }
+
     function checkIconSvg() {
       return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>';
     }
@@ -5060,7 +5131,10 @@ INDEX_HTML = """
     function renderMediaModalActionButton(payload, owned, jellyfinUrl) {
       const task = activeMediaTaskForPayload(payload);
       if (task) {
-        return `<a class="media-modal-action-icon is-task-status" href="${escapeHtml(downloadsTaskUrl(task.id))}" title="Open download">${downloadIconSvg()}<span>${escapeHtml(taskStatusLabel(task))}</span></a>`;
+        return `<a class="media-modal-action-icon is-task-status is-busy" href="${escapeHtml(downloadsTaskUrl(task.id))}" title="Open download">${spinnerIconSvg()}<span>${escapeHtml(taskStatusLabel(task))}</span></a>`;
+      }
+      if (activeAutoDownloadRequestForPayload(payload)) {
+        return `<button class="media-modal-action-icon is-busy" type="button" title="Auto download running" aria-label="Auto download running" disabled>${spinnerIconSvg()}</button>`;
       }
       if (owned && jellyfinUrl) {
         return `<a class="media-modal-action-icon is-owned" href="${escapeHtml(jellyfinUrl)}" target="_blank" rel="noreferrer" title="Open in Jellyfin">${jellyfinIconSvg()}</a>`;
@@ -5113,6 +5187,21 @@ INDEX_HTML = """
                     const key = `season:${seasonNumber}`;
                     const localOwned = seasonIsFullyDownloaded(season, localStatuses, seasonNumber);
                     const url = season.jellyfin_url || localStatuses[key]?.jellyfin_url || owned?.jellyfin_url || details?.jellyfin_url || jellyfinSearchUrl(item.title || season.search_hint || "");
+                    const episodePayloads = (season.episodes || []).map((episode) => {
+                      const episodeSeasonNumber = episode.season_number || seasonNumber;
+                      const episodeNumber = episode.episode_number || 1;
+                      const episodeKey = episodeStatusKey(episodeSeasonNumber, episodeNumber);
+                      if (localStatuses[episodeKey]?.exists) return null;
+                      return {
+                        title: item.title || episode.search_hint || "",
+                        year: item.year || "",
+                        media_type: "tv",
+                        season: episodeSeasonNumber,
+                        episode: episodeNumber,
+                        poster_url: item.poster_url || "",
+                        backdrop_url: item.backdrop_url || "",
+                      };
+                    }).filter(Boolean);
                     return renderMediaModalActionButton(
                       {
                         title: item.title || season.search_hint || "",
@@ -5122,6 +5211,7 @@ INDEX_HTML = """
                         episode: 1,
                         poster_url: item.poster_url || "",
                         backdrop_url: item.backdrop_url || "",
+                        batch_items: episodePayloads,
                       },
                       localOwned,
                       url
@@ -5450,6 +5540,20 @@ INDEX_HTML = """
       return parts.join(" ");
     }
 
+    function autoDownloadEpisodeCode(payload) {
+      if (!payload?.season || !payload?.episode) return "";
+      return `S${String(payload.season).padStart(2, "0")}E${String(payload.episode).padStart(2, "0")}`;
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function autoFindBatchDelayMs() {
+      const site = String(browserSiteSelect?.value || "yflix").toLowerCase();
+      return site === "yflix" ? 25000 : 5000;
+    }
+
     function addAutoDownloadRequest(payload) {
       restoreAutoDownloadRequests();
       const createdAt = new Date();
@@ -5458,12 +5562,13 @@ INDEX_HTML = """
         title: autoDownloadLabel(payload),
         status: "starting",
         created_at: createdAt.toISOString(),
-        logs: [`${createdAt.toLocaleTimeString()} Created auto-download request.`],
+        logs: [`${createdAt.toLocaleTimeString()} Created auto-download request for ${autoDownloadLabel(payload)}.`],
         payload,
       };
       window.__autoDownloadRequests.unshift(request);
       persistAutoDownloadRequests();
       renderAutoDownloadRequests();
+      renderOpenMediaModalActions();
       return request;
     }
 
@@ -5473,6 +5578,30 @@ INDEX_HTML = """
       request.logs.push(`${new Date().toLocaleTimeString()} ${message}`);
       persistAutoDownloadRequests();
       renderAutoDownloadRequests();
+      renderOpenMediaModalActions();
+    }
+
+    function captureAutoRequestUiState(scope) {
+      const state = {};
+      scope?.querySelectorAll(".auto-request-item[data-request-id]").forEach((row) => {
+        const requestId = row.dataset.requestId;
+        if (!requestId) return;
+        state[requestId] = {
+          open: !!row.open,
+          logScrollTop: row.querySelector(".auto-request-log")?.scrollTop || 0
+        };
+      });
+      return state;
+    }
+
+    function restoreAutoRequestUiState(scope, state) {
+      scope?.querySelectorAll(".auto-request-item[data-request-id]").forEach((row) => {
+        const saved = state[row.dataset.requestId];
+        if (!saved) return;
+        row.open = !!saved.open;
+        const log = row.querySelector(".auto-request-log");
+        if (log) log.scrollTop = saved.logScrollTop || 0;
+      });
     }
 
     function autoRequestStatusClass(status) {
@@ -5492,23 +5621,19 @@ INDEX_HTML = """
         const status = String(match.status || "queued");
         const alreadyLinked = request.task_id === match.id;
         request.task_id = match.id;
-        if (status === "completed") {
-          request.status = "completed";
-          if (!request.completed_logged) {
-            request.logs.push(`${new Date().toLocaleTimeString()} Download completed as ${match.title || match.id}.`);
-            request.completed_logged = true;
-          }
-        } else if (status === "failed" || status === "stopped") {
+        if (status === "failed" || status === "stopped") {
           request.status = status;
           if (!request.finished_logged) {
             request.logs.push(`${new Date().toLocaleTimeString()} Download ${status}: ${match.error || match.title || match.id}.`);
             request.finished_logged = true;
           }
         } else {
-          request.status = status === "running" ? "running" : "queued";
-          if (!alreadyLinked && !request.queued_logged) {
-            request.logs.push(`${new Date().toLocaleTimeString()} Stream detected and queued as ${match.title || match.id}.`);
+          request.status = "completed";
+          if (!alreadyLinked || !request.queued_logged) {
+            request.logs.push(`${new Date().toLocaleTimeString()} Real download triggered as ${match.title || match.id} (${status}).`);
+            request.logs.push(`${new Date().toLocaleTimeString()} Auto-download request complete; follow progress on the Downloads page.`);
             request.queued_logged = true;
+            request.completed_logged = true;
           }
         }
         changed = true;
@@ -5536,13 +5661,14 @@ INDEX_HTML = """
     function renderAutoDownloadRequests() {
       const list = document.getElementById("auto-download-request-list");
       if (!list) return;
+      const uiState = captureAutoRequestUiState(list);
       const requests = restoreAutoDownloadRequests();
       if (!requests.length) {
         list.innerHTML = '<div class="empty">No auto-download requests are running.</div>';
         return;
       }
       list.innerHTML = requests.map((request) => `
-        <details class="auto-request-item">
+        <details class="auto-request-item" data-request-id="${escapeHtml(request.id || "")}">
           <summary class="auto-request-top">
             <time class="auto-request-time">${escapeHtml(formatAutoDownloadTimestamp(request.created_at))}</time>
             <div class="auto-request-title">${escapeHtml(request.title)}</div>
@@ -5551,12 +5677,16 @@ INDEX_HTML = """
           <pre class="auto-request-log">${escapeHtml((request.logs || []).join("\\n"))}</pre>
         </details>
       `).join("");
+      restoreAutoRequestUiState(list, uiState);
     }
 
     function waitForAutoDownloadQueued(payload, existingIds, request) {
       const startedAt = Date.now();
+      let attempts = 0;
+      appendAutoDownloadLog(request, "Polling Downloads for a newly queued task.", "searching");
       return new Promise((resolve) => {
         const timer = setInterval(async () => {
+          attempts += 1;
           try {
             const response = await fetch("/api/tasks");
             if (response.ok) {
@@ -5568,21 +5698,67 @@ INDEX_HTML = """
                 clearInterval(timer);
                 request.task_id = match.id;
                 request.queued_logged = true;
-                appendAutoDownloadLog(request, `Stream detected and queued as ${match.title || match.id}.`, match.status === "running" ? "running" : match.status === "completed" ? "completed" : "queued");
+                request.completed_logged = true;
+                appendAutoDownloadLog(request, `Real download triggered as ${match.title || match.id} (${match.status || "queued"}).`, "completed");
+                appendAutoDownloadLog(request, "Auto-download request complete; follow progress on the Downloads page.", "completed");
                 resolve(match);
                 return;
               }
+              if (attempts === 1 || attempts % 5 === 0) {
+                appendAutoDownloadLog(request, `Still waiting for a matching queued task (${attempts} checks).`, "searching");
+              }
             }
-          } catch (_error) {
-            // Keep waiting; the regular refresh loop will also recover state.
+          } catch (error) {
+            if (attempts === 1 || attempts % 5 === 0) {
+              appendAutoDownloadLog(request, `Task poll failed; retrying (${String(error).slice(0, 120)}).`, "searching");
+            }
           }
           if (Date.now() - startedAt > 45000) {
             clearInterval(timer);
-            appendAutoDownloadLog(request, "Timed out waiting for a queued stream. The browser may still be working.", "failed");
+            appendAutoDownloadLog(request, "Timed out waiting for a queued task. Continuing with the next request if this is a batch.", "failed");
             resolve(null);
           }
         }, 1400);
       });
+    }
+
+    async function startAutoFindPayload(payload, existingIds, context = {}) {
+      const request = addAutoDownloadRequest(payload);
+      const code = autoDownloadEpisodeCode(payload);
+      const prefix = context.total ? `Batch ${context.index}/${context.total}${code ? ` ${code}` : ""}: ` : "";
+      appendAutoDownloadLog(request, `${prefix}Preparing remote browser request.`, "starting");
+      appendAutoDownloadLog(request, `Title: ${payload.title || "Untitled"}${payload.year ? ` (${payload.year})` : ""}.`, "starting");
+      if (code) {
+        appendAutoDownloadLog(request, `Episode target: ${code}.`, "starting");
+      }
+      appendAutoDownloadLog(request, `Site: ${browserSiteSelect?.value || "yflix"}.`, "starting");
+      const response = await fetch("/api/media/auto-find", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, site: browserSiteSelect?.value || "yflix" })
+      });
+      if (!response.ok) {
+        appendAutoDownloadLog(request, `Remote browser request failed with HTTP ${response.status}.`, "failed");
+        throw new Error(`Auto-find failed with ${response.status}`);
+      }
+      const result = await response.json();
+      appendAutoDownloadLog(request, `Browser command ${result.browser_command_id || ""} issued for ${result.site}.`, "searching");
+      appendAutoDownloadLog(request, `Search hint: ${result.search_hint || payload.title || "title"}.`, "searching");
+      if (result.target_url) {
+        appendAutoDownloadLog(request, `Target URL: ${result.target_url}.`, "searching");
+      }
+      appendAutoDownloadLog(request, "Waiting for the stream detector to report an HLS playlist and queue a real download.", "searching");
+      try {
+        await navigator.clipboard.writeText(result.search_hint || payload.title || "");
+        appendAutoDownloadLog(request, "Copied search hint to clipboard.", "searching");
+      } catch (_error) {
+        appendAutoDownloadLog(request, "Clipboard copy skipped or unavailable.", "searching");
+      }
+      const queuedTask = await waitForAutoDownloadQueued(payload, existingIds, request);
+      if (queuedTask?.id) {
+        existingIds.add(queuedTask.id);
+      }
+      return queuedTask;
     }
 
     function bindMediaActions(scope) {
@@ -5599,35 +5775,48 @@ INDEX_HTML = """
           const encoded = button.dataset.mediaAutofind;
           if (!encoded) return;
           const payload = JSON.parse(decodeURIComponent(encoded));
+          const payloads = autoFindItemsForPayload(payload);
           const existingIds = new Set(allTasks().map((task) => task.id));
-          const request = addAutoDownloadRequest(payload);
-          showAutoDownloadToast(payload.title || "Auto download", "Auto download started in the background.");
+          const toastTitle = payloads.length > 1 ? `${payload.title || "Season"} downloads` : payload.title || "Auto download";
+          const toastCopy = payloads.length > 1
+            ? `${payloads.length} episode downloads queued with pacing to avoid site rate limits.`
+            : "Auto download started in the background.";
+          showAutoDownloadToast(toastTitle, toastCopy);
           button.disabled = true;
           try {
-            appendAutoDownloadLog(request, "Sending request to the remote browser.", "starting");
-            const response = await fetch("/api/media/auto-find", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ ...payload, site: browserSiteSelect?.value || "yflix" })
-            });
-            if (!response.ok) {
-              throw new Error(`Auto-find failed with ${response.status}`);
+            const results = [];
+            const batchDelay = payloads.length > 1 ? autoFindBatchDelayMs() : 0;
+            for (const [index, item] of payloads.entries()) {
+              try {
+                const queuedTask = await startAutoFindPayload(item, existingIds, {
+                  index: index + 1,
+                  total: payloads.length,
+                });
+                renderOpenMediaModalActions();
+                results.push({ status: "fulfilled", value: queuedTask });
+              } catch (error) {
+                console.error(error);
+                showAutoDownloadToast(
+                  "Episode auto download failed",
+                  `${autoDownloadEpisodeCode(item) || item.title || "Episode"} failed; continuing batch.`
+                );
+                results.push({ status: "fulfilled", value: null });
+              }
+              if (batchDelay && index < payloads.length - 1) {
+                showAutoDownloadToast(
+                  `${payload.title || "Season"} batch paused`,
+                  `Waiting ${Math.round(batchDelay / 1000)} seconds before the next episode to avoid site rate limits.`
+                );
+                await sleep(batchDelay);
+              }
             }
-            const result = await response.json();
-            appendAutoDownloadLog(request, `Browser command ${result.browser_command_id || ""} issued for ${result.site}: ${result.search_hint || payload.title || "title"}.`, "searching");
-            appendAutoDownloadLog(request, "Waiting for the stream detector to report an HLS playlist.", "searching");
-            try {
-              await navigator.clipboard.writeText(result.search_hint || payload.title || "");
-            } catch (_error) {
-              // Clipboard is optional; the hint still renders in the side panel.
+            const triggeredCount = results.filter((result) => result.status === "fulfilled" && result.value).length;
+            if (payloads.length > 1) {
+              showAutoDownloadToast(
+                `${payload.title || "Season"} batch finished`,
+                `${triggeredCount}/${payloads.length} episode requests triggered real downloads.`
+              );
             }
-            const queuedTask = await waitForAutoDownloadQueued(payload, existingIds, request);
-            if (queuedTask) {
-              renderOpenMediaModalActions();
-            }
-          } catch (error) {
-            console.error(error);
-            appendAutoDownloadLog(request, "Auto download could not start. Check Mullvad and the remote browser.", "failed");
           } finally {
             button.disabled = false;
           }
