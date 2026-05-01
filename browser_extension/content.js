@@ -433,12 +433,12 @@
     yflixAutoAttempts += 1;
     setTimeout(() => {
       let handled = false;
-      if (location.pathname.startsWith("/browser")) {
+      if (location.pathname.startsWith("/browser") || location.pathname.startsWith("/filter")) {
         handled = runYflixSearchAutoFind(intent);
       } else if (location.pathname.startsWith("/watch/")) {
         handled = runYflixWatchAutoFind(intent);
       }
-      if (!handled && location.pathname.startsWith("/browser")) {
+      if (!handled && (location.pathname.startsWith("/browser") || location.pathname.startsWith("/filter"))) {
         yflixAutoStarted = false;
       }
     }, 700);

@@ -72,7 +72,7 @@ class MediaCatalog:
             search_hint = "Search title"
         if site == "yflix":
             query = {
-                "keyword": clean_title or search_hint,
+                "keyword": (clean_title or search_hint).lower(),
                 "isambard_title": clean_title,
                 "isambard_year": clean_year,
                 "isambard_media_type": normalized_media_type,
@@ -85,7 +85,7 @@ class MediaCatalog:
                 query["isambard_poster_url"] = poster_url
             if backdrop_url:
                 query["isambard_backdrop_url"] = backdrop_url
-            target = "https://yflix.to/browser?" + urllib.parse.urlencode(query)
+            target = "https://yflix.to/filter?" + urllib.parse.urlencode(query)
         else:
             target = "https://dashflix.top/"
         return {
