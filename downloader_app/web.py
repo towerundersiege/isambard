@@ -103,6 +103,7 @@ def build_app(
     app = FastAPI(title="Downloader")
     app.mount("/extension", StaticFiles(directory=EXTENSION_DIR), name="extension")
     install_music(app, music_manager)
+    app.state.startup_id = str(time.time_ns())
     app.state.browser_state = {
         "page_url": "",
         "page_title": "",
@@ -392,6 +393,7 @@ def build_app(
     def system_summary() -> dict:
         usage = shutil.disk_usage(download_manager.downloads_dir)
         return {
+            "startup_id": app.state.startup_id,
             "downloads_path": str(download_manager.downloads_dir),
             "mullvad": mullvad_guard.status(force=True),
             "disk": {
@@ -2480,7 +2482,7 @@ INDEX_HTML = """
     }
     .auto-request-top {
       display: grid;
-      grid-template-columns: 158px minmax(0, 1fr) auto;
+      grid-template-columns: 158px minmax(0, 1fr) auto 28px;
       align-items: center;
       gap: 12px;
       padding: 10px 12px;
@@ -2504,6 +2506,24 @@ INDEX_HTML = """
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+    .auto-request-delete {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.04);
+      color: var(--text-muted);
+      cursor: pointer;
+      display: inline-grid;
+      place-items: center;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .auto-request-delete:hover {
+      color: var(--text-strong);
+      background: rgba(239,68,68,0.14);
+      border-color: rgba(239,68,68,0.28);
     }
     .auto-request-log {
       margin: 0;
@@ -5455,6 +5475,50 @@ INDEX_HTML = """
       writeSessionJson(AUTO_DOWNLOAD_REQUESTS_KEY, window.__autoDownloadRequests || []);
     }
 
+    function failInterruptedAutoDownloadRequests() {
+      const requests = restoreAutoDownloadRequests();
+      let changed = false;
+      requests.forEach((request) => {
+        const status = String(request?.status || "").toLowerCase();
+        if (!request || !["starting", "searching", "queued", "running"].includes(status)) {
+          return;
+        }
+        request.status = "failed";
+        request.finished_logged = true;
+        request.logs = Array.isArray(request.logs) ? request.logs : [];
+        request.logs.push(`${new Date().toLocaleTimeString()} Auto-download request failed because the app restarted before a stream was queued.`);
+        changed = true;
+      });
+      if (changed) {
+        persistAutoDownloadRequests();
+      }
+    }
+
+    function handleSystemStartupChange(summary) {
+      const startupId = String(summary?.startup_id || "");
+      if (!startupId) return;
+      if (!window.__systemStartupId) {
+        window.__systemStartupId = startupId;
+        return;
+      }
+      if (window.__systemStartupId === startupId) {
+        return;
+      }
+      window.__systemStartupId = startupId;
+      failInterruptedAutoDownloadRequests();
+      renderAutoDownloadRequests();
+      renderOpenMediaModalActions();
+    }
+
+    function deleteAutoDownloadRequest(requestId) {
+      const id = String(requestId || "");
+      if (!id) return;
+      window.__autoDownloadRequests = restoreAutoDownloadRequests().filter((request) => request?.id !== id);
+      persistAutoDownloadRequests();
+      renderAutoDownloadRequests();
+      renderOpenMediaModalActions();
+    }
+
     function activeAutoDownloadToasts() {
       const now = Date.now();
       const active = readSessionJson(AUTO_DOWNLOAD_TOASTS_KEY, []).filter((toast) => Number(toast.expires_at || 0) > now);
@@ -5673,11 +5737,19 @@ INDEX_HTML = """
             <time class="auto-request-time">${escapeHtml(formatAutoDownloadTimestamp(request.created_at))}</time>
             <div class="auto-request-title">${escapeHtml(request.title)}</div>
             <span class="status-pill ${escapeHtml(autoRequestStatusClass(request.status))}">${escapeHtml(request.status)}</span>
+            <button class="auto-request-delete" type="button" data-auto-request-delete="${escapeHtml(request.id || "")}" aria-label="Delete auto-download request" title="Delete">×</button>
           </summary>
           <pre class="auto-request-log">${escapeHtml((request.logs || []).join("\\n"))}</pre>
         </details>
       `).join("");
       restoreAutoRequestUiState(list, uiState);
+      list.querySelectorAll("[data-auto-request-delete]").forEach((button) => {
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          deleteAutoDownloadRequest(button.dataset.autoRequestDelete);
+        });
+      });
     }
 
     function waitForAutoDownloadQueued(payload, existingIds, request) {
@@ -6383,6 +6455,7 @@ INDEX_HTML = """
         return;
       }
       window.__systemSummary = await response.json();
+      handleSystemStartupChange(window.__systemSummary);
       renderSystemSummary();
     }
 
@@ -6704,6 +6777,7 @@ INDEX_HTML = """
       document.getElementById("sidebar-collapse-btn")?.setAttribute("aria-pressed", "true");
     }
     restoreAutoDownloadRequests();
+    failInterruptedAutoDownloadRequests();
     restoreActiveAutoDownloadToasts();
     switchMediaView("__INITIAL_MEDIA_VIEW__", { updateHistory: false });
     updatePageVisibilityState();
