@@ -71,21 +71,22 @@ class MediaCatalog:
         if not search_hint:
             search_hint = "Search title"
         if site == "yflix":
-            query = {
-                "keyword": (clean_title or search_hint).lower(),
+            query = {"keyword": clean_title or search_hint}
+            intent = {
                 "isambard_title": clean_title,
                 "isambard_year": clean_year,
                 "isambard_media_type": normalized_media_type,
             }
             if season:
-                query["isambard_season"] = str(season)
+                intent["isambard_season"] = str(season)
             if episode:
-                query["isambard_episode"] = str(episode)
+                intent["isambard_episode"] = str(episode)
             if poster_url:
-                query["isambard_poster_url"] = poster_url
+                intent["isambard_poster_url"] = poster_url
             if backdrop_url:
-                query["isambard_backdrop_url"] = backdrop_url
-            target = "https://yflix.to/filter?" + urllib.parse.urlencode(query)
+                intent["isambard_backdrop_url"] = backdrop_url
+            target = "https://yflix.to/browser?" + urllib.parse.urlencode(query)
+            target += "#" + urllib.parse.urlencode(intent)
         else:
             target = "https://dashflix.top/"
         return {

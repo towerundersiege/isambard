@@ -51,7 +51,8 @@ function isSupportedUrl(url) {
 
 function hasAutoIntentParams(url) {
   try {
-    return new URL(url).searchParams.has("isambard_title");
+    const parsed = new URL(url);
+    return parsed.searchParams.has("isambard_title") || new URLSearchParams(parsed.hash.slice(1)).has("isambard_title");
   } catch (_error) {
     return false;
   }
@@ -60,7 +61,8 @@ function hasAutoIntentParams(url) {
 function autoIntentFromUrl(url) {
   try {
     const parsed = new URL(url);
-    const params = parsed.searchParams;
+    const hashParams = new URLSearchParams(parsed.hash.slice(1));
+    const params = hashParams.has("isambard_title") ? hashParams : parsed.searchParams;
     if (!params.has("isambard_title")) {
       return null;
     }

@@ -288,9 +288,11 @@
     if (HOST !== "yflix.to") {
       return null;
     }
-    const params = new URLSearchParams(location.search);
+    const queryParams = new URLSearchParams(location.search);
+    const hashParams = new URLSearchParams(location.hash.replace(/^#/, ""));
+    const params = hashParams.has("isambard_title") ? hashParams : queryParams;
     const title = normalizeVisibleText(params.get("isambard_title") || "");
-    const keyword = normalizeVisibleText(params.get("keyword") || "");
+    const keyword = normalizeVisibleText(queryParams.get("keyword") || params.get("keyword") || "");
     if (!title && !keyword) {
       return null;
     }
